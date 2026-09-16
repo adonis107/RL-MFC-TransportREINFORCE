@@ -1,4 +1,4 @@
-# MFC Transport REINFORCE
+# MFC-Transport-REINFORCE
 
 Code for mean-field control experiments comparing:
 
