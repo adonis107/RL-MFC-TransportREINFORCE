@@ -26,25 +26,25 @@ OPTIMAL = "#52514e"
 GRID, INK, MUTED = "#d8d7d2", "#0b0b0b", "#52514e"
 
 RUNS = {
-    "Linear--quadratic": {"dir": "lq", "optimum": -7.223777, "runs": {
+    "Linear--quadratic": {"config": r"$\lambda=0.1,\ K=1$", "dir": "lq", "optimum": -7.223777, "runs": {
         "REINFORCE": "reinforce_none_T_20_exact", "MF-REINFORCE": None,
-        "Transport": "transport_lambda_0.1_eta_0.85_K_3_T_20_particle"}},
+        "Transport": "transport_lambda_0.1_eta_0.85_K_1_T_20_particle"}},
 
-    "Portfolio": {"dir": "portfolio", "optimum": -13.153766, "runs": {
+    "Portfolio": {"config": r"$\lambda=0.4,\ K=1$", "dir": "portfolio", "optimum": -13.153766, "runs": {
         "REINFORCE": "reinforce_none_T_10_exact", "MF-REINFORCE": None,
         "Transport": "transport_lambda_0.4_eta_0.85_K_1_T_10_particle"}},
 
-    "Two-state": {"dir": "twostate", "optimum": -2.640, "runs": {
+    "Two-state": {"config": r"$\lambda=0.05,\ \eta=0.85$", "corner": ("left", "bottom"), "dir": "twostate", "optimum": -2.640, "runs": {
         "REINFORCE": "reinforce_none_T_5_exact", "MF-REINFORCE": None,
-        "Transport": "transport_lambda_0.1_eta_0.95_T_5_exact"}},
+        "Transport": "transport_lambda_0.05_eta_0.85_T_5_exact"}},
 
-    "Distribution": {"dir": "distribution", "optimum": -0.056991, "runs": {
+    "Distribution": {"config": r"$\lambda=0.2,\ \eta=0.98,\ \sigma=0.5$", "dir": "distribution", "optimum": -0.056991, "runs": {
         "REINFORCE": "reinforce_none_T_5_exact", "MF-REINFORCE": "mfreinforce_eps_2_T_5_exact",
         "Transport": None}},
 
 }
 OVERRIDE = {
-    ("Two-state", "MF-REINFORCE"): ("results/mfr_tuned_twostate/twostate", "mfreinforce_eps_0.2_T_5_exact"),
+    ("Two-state", "MF-REINFORCE"): ("results/ts_mfr_tuned/twostate", "mfreinforce_eps_0.2_T_5_exact"),
     ("Distribution", "Transport"): ("results/tuned_scales/distribution", "transport_lambda_0.2_eta_0.98_T_5_exact"),
 }
 
@@ -70,15 +70,15 @@ def style(ax):
 
 
 def curves(directory, stem):
+    """Per-seed validation curves, truncated to their common length."""
     values = []
     for path in sorted(Path(directory).glob(f"{stem}_seed_*")):
         history = json.loads((path / "history.json").read_text())
         values.append(history["validation_objective"])
     if not values:
-        return None, None
+        return None
     length = min(len(v) for v in values)
-    array = np.array([v[:length] for v in values])
-    return array.mean(axis=0), array.std(axis=0)
+    return np.array([v[:length] for v in values])
 
 
 def learning_curves(output):
@@ -92,14 +92,23 @@ def learning_curves(output):
                 directory = ROOT / sub
             if resolved is None:
                 continue
-            mean, deviation = curves(directory, resolved)
-            if mean is None:
+            seeds = curves(directory, resolved)
+            if seeds is None:
                 continue
-            steps = np.arange(1, len(mean) + 1) * 10
-            gap = np.abs(mean - spec["optimum"])
+            steps = np.arange(1, seeds.shape[1] + 1) * 10
+            # Optimality gap on a log axis keeps methods spanning orders of magnitude legible.
+            # The band is the spread of the per-seed gaps, not the gap of the mean curve.
+            gaps = np.abs(seeds - spec["optimum"])
+            gap, deviation = gaps.mean(axis=0), gaps.std(axis=0)
             panel.append(list(gap))
             ax.plot(steps, gap, color=METHOD_COLOR[method], linewidth=1.1, label=method)
-        ax.set_title(name.replace("--", "\u2013"), fontsize=8, color=INK, pad=3)
+            floor = gap.min() * 0.25
+            ax.fill_between(steps, np.maximum(gap - deviation, floor), gap + deviation,
+                            color=METHOD_COLOR[method], alpha=0.20, linewidth=0)
+        ax.set_title(name.replace("--", "\u2013"), fontsize=8, color=INK, pad=12)
+        # Configuration as a subtitle above the axes, so it never sits over the data.
+        ax.text(0.5, 1.015, spec["config"], transform=ax.transAxes, ha="center", va="bottom",
+                fontsize=6.4, color=MUTED)
         ax.set_yscale("log")
         ax.set_xlabel("policy updates", fontsize=7.5)
         ax.set_ylabel(r"$|J(\theta)-J(\theta^\star)|$", fontsize=7.5)
@@ -111,8 +120,13 @@ def learning_curves(output):
         ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
         ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(compact))
 
-    handles, labels = axes.flat[1].get_legend_handles_labels()
-    figure.legend(handles, labels, loc="outside lower center", ncol=3, frameon=False, handlelength=1.8)
+    found = {}
+    for ax in axes.flat:
+        for handle, label in zip(*ax.get_legend_handles_labels()):
+            found.setdefault(label, handle)
+    order = [m for m in ("REINFORCE", "MF-REINFORCE", "Transport") if m in found]
+    figure.legend([found[m] for m in order], order, loc="outside lower center",
+                  ncol=3, frameon=False, handlelength=1.8)
     figure.savefig(output, bbox_inches="tight")
     figure.savefig(Path(output).with_suffix(".png"), dpi=200, bbox_inches="tight")
 
@@ -149,8 +163,8 @@ def learned_versus_optimal(output):
     style(axes[0])
 
     env = TwoState(TwoStateConfig(T=5))
-    runs = {"Transport": "results/twostate/transport_lambda_0.1_eta_0.95_T_5_exact_seed_0",
-            "MF-REINFORCE": "results/mfr_tuned_twostate/twostate/mfreinforce_eps_0.2_T_5_exact_seed_0",
+    runs = {"Transport": "results/twostate/transport_lambda_0.05_eta_0.85_T_5_exact_seed_0",
+            "MF-REINFORCE": "results/ts_mfr_tuned/twostate/mfreinforce_eps_0.2_T_5_exact_seed_0",
             "REINFORCE": "results/twostate/reinforce_none_T_5_exact_seed_0"}
     steps = np.arange(env.config.T + 1)
     for name, theta in [(r"$\theta^\star$", env.optimal_theta())] + [
@@ -203,6 +217,49 @@ def learned_versus_optimal(output):
     figure.savefig(Path(output).with_suffix(".png"), dpi=200, bbox_inches="tight")
 
 
+def appendix_benchmarks(output):
+    """Validation objective on the two benchmarks reported in the appendix.
+
+    Neither separates the estimators. The objective is plotted directly rather than as an
+    optimality gap because cybersecurity has no closed-form optimum.
+    """
+    panels = [
+        ("Cybersecurity", "results/cybersecurity", None, {
+            "REINFORCE": "reinforce_none_T_3_exact",
+            "MF-REINFORCE": "mfreinforce_eps_1_T_3_exact",
+            "Transport": "transport_lambda_0.4_eta_0.85_T_3_exact"}, r"$\lambda=0.4$"),
+        ("Advertising", "results/advertising", 1.006168, {
+            "REINFORCE": "reinforce_none_T_5_exact",
+            "MF-REINFORCE": "mfreinforce_eps_1_T_5_exact",
+            "Transport": "transport_lambda_0.2_eta_0.85_T_5_exact"}, r"$\lambda=0.2$"),
+    ]
+    figure, axes = plt.subplots(1, 2, figsize=(5.5, 2.15), constrained_layout=True)
+    for ax, (title, directory, optimum, runs, config) in zip(axes, panels):
+        for method, stem in runs.items():
+            seeds = curves(ROOT / directory, stem)
+            if seeds is None:
+                continue
+            steps = np.arange(1, seeds.shape[1] + 1) * 10
+            mean, deviation = seeds.mean(axis=0), seeds.std(axis=0)
+            ax.plot(steps, mean, color=METHOD_COLOR[method], linewidth=1.1, label=method)
+            ax.fill_between(steps, mean - deviation, mean + deviation,
+                            color=METHOD_COLOR[method], alpha=0.20, linewidth=0)
+        if optimum is not None:
+            ax.axhline(optimum, color=OPTIMAL, linewidth=0.9, dashes=(3, 2))
+        ax.set_title(title, fontsize=8, color=INK, pad=12)
+        ax.text(0.5, 1.015, config, transform=ax.transAxes, ha="center", va="bottom",
+                fontsize=6.4, color=MUTED)
+        ax.set_xlabel("policy updates", fontsize=7.5)
+        ax.set_ylabel(r"$J(\theta)$", fontsize=7.5)
+        style(ax)
+    handles, labels = axes[0].get_legend_handles_labels()
+    handles.append(plt.Line2D([], [], color=OPTIMAL, linewidth=0.9, dashes=(3, 2)))
+    labels.append(r"$J(\theta^\star)$")
+    figure.legend(handles, labels, loc="outside lower center", ncol=4, frameon=False, handlelength=1.8)
+    figure.savefig(output, bbox_inches="tight")
+    figure.savefig(Path(output).with_suffix(".png"), dpi=200, bbox_inches="tight")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-root", default="files/iclr2027/figures")
@@ -215,6 +272,8 @@ def main():
     print("wrote learning_curves.pdf")
     learned_versus_optimal(out / "learned_policies.pdf")
     print("wrote learned_policies.pdf")
+    appendix_benchmarks(out / "appendix_benchmarks.pdf")
+    print("wrote appendix_benchmarks.pdf")
 
 
 if __name__ == "__main__":

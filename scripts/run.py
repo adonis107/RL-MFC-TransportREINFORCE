@@ -14,6 +14,16 @@ DISCRETE_REFERENCE = {
     "advertising": {"n_particles": 200, "n_gradient": 10},
 }
 
+# Auxiliary split selected for MF-REINFORCE against each benchmark's gradient oracle, by the same
+# procedure used to size the transport block. Its cost model is B*T + n*T*(T+1), so these respect the
+# same matched budget as the published allocation they replace. Benchmarks absent here were screened
+# and carried too little gradient signal for the selection to mean anything, so they keep the
+# published allocation of the reference configuration.
+MF_REINFORCE_SPLITS = {
+    "twostate": {"n_particles": 20, "n_logit_gradient": 40},
+    "distribution": {"n_particles": 260, "n_logit_gradient": 50},
+}
+
 CONTINUOUS_REFERENCE = {
     "lq": {"n_particles": 200, "n_gradient": 1},
     "portfolio": {"n_particles": 500, "n_gradient": 1},
@@ -68,7 +78,8 @@ def continuous_transport_jobs(env, horizon, lambdas, components=None):
 def experiment_plan(env):
     if env == "twostate":
         jobs = []
-        for horizon in (2, 5):
+        # T = 5 only: the shorter horizon separates the estimators too weakly to add anything.
+        for horizon in (5,):
             jobs.append(job(env, "reinforce", horizon))
             for flow in ("exact", "particle"):
                 jobs.append(job(env, "mfreinforce", horizon, flow=flow, perturbation=0.2))
@@ -153,8 +164,9 @@ def fair_run_parameters(job_spec):
 
     parameters = {}
     if algorithm == "mfreinforce":
-        parameters["n_particles"] = ref_particles
-        parameters["n_logit_gradient"] = ref_gradient
+        selected = MF_REINFORCE_SPLITS.get(env, {})
+        parameters["n_particles"] = selected.get("n_particles", ref_particles)
+        parameters["n_logit_gradient"] = selected.get("n_logit_gradient", ref_gradient)
     elif algorithm == "reinforce":
         parameters["n_particles"] = (
             continuous_budget(env, horizon)
