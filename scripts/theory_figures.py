@@ -1,9 +1,10 @@
 """Figure for the numerical verification of the perturbation results.
 
-Panel (a): the perturbation estimate, as the realized deviation divided by lambda. A
-flat line means the bound is proportional to lambda with the constant shown.
-Panel (b): the perturbation consistency of the gradient, log-log against lambda, with
-slope-1 and slope-2 guides.
+Panel (a): the perturbation estimate, as the realized finite-state deviation divided
+by lambda and the continuous-state projected deviation divided by sqrt(lambda). A
+flat line means the measured deviation follows the corresponding reference scale.
+Panel (b): finite-state perturbation consistency of the gradient, log-log against
+lambda.
 
     uv run python scripts/theory_figures.py
 """
@@ -69,7 +70,7 @@ def main():
     axes[0].set_xscale("log")
     axes[0].set_ylim(0.0, 1.25)
     axes[0].set_xlabel(r"$\lambda$")
-    axes[0].set_ylabel(r"deviation$\,/\,\lambda$")
+    axes[0].set_ylabel(r"scaled deviation")
     axes[0].set_title("(a) perturbation estimate", fontsize=8, color=INK, pad=4)
     style(axes[0])
 

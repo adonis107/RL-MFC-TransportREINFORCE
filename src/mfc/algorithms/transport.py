@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import copy
 import math
 import importlib
 import inspect
@@ -676,6 +677,9 @@ class ContinuousTransportConfig:
     sigma_min: float = 1e-2
     sigma_max: float = 1e2
     mean_radius: float | None = 1e3
+    weight_randomizer_sigma: float = 1.0
+    mean_randomizer_sigma: float = 1.0
+    log_scale_randomizer_sigma: float = 1.0
     quadrature_nodes: int = 24
     jacobian_floor: float = 1e-1
     flow: str = "particle"
@@ -716,23 +720,25 @@ class AdaptiveContinuousTransportConfig(ContinuousTransportConfig):
 class ContinuousTransport:
     """Transport REINFORCE on the Gaussian-mixture chart of the population law.
 
-    The population law is represented by the coordinate z of a K-component
-    Gaussian mixture, the perturbation is a Gaussian displacement of that
-    coordinate, and the population argument of the policy, reward, and transition
-    is the decoded mixture Gamma_K(z + lambda U). One policy update runs the three
-    independent simulation blocks of Algorithm "Transport REINFORCE":
+    The population law is represented by the fitted parameters of a K-component
+    Gaussian mixture. The main perturbation follows the transport construction in
+    the reference: component weights are mixed with random weights, component
+    means are moved toward random target means, and one-dimensional component
+    standard deviations move along their Gaussian Wasserstein geodesics. One
+    policy update runs the three independent simulation blocks of Algorithm
+    "Transport REINFORCE":
 
       1. M population particles, whose empirical law is fitted at every time by
-         the EM rule R_K, give the coordinates z_t and the score Jacobians A_t;
-      2. n auxiliary trajectories at radius eta give the population sensitivities
-         D_t = grad_theta z_t = -A_t^{-1} B_t, recursively in t;
+         the EM rule R_K, give the coordinates z_t;
+      2. n auxiliary particles, allocated across centered shifts of the policy
+         coordinates, give the population sensitivities D_t = grad_theta z_t;
       3. B main trajectories at radius lambda give the gradient estimate, whose
-         mean-field correction is the coordinate score U_t / lambda contracted
-         with D_t.
+         mean-field correction is the randomized-mixture score contracted with
+         D_t.
 
     Nothing in the three blocks uses a density or a derivative of the transition
     kernel: only sampled states and actions, the known policy score, and the
-    known Gaussian-mixture density enter the formulas.
+    known perturbation density enter the formulas.
     """
 
     def __init__(self, env, policy=None, config=ContinuousTransportConfig()):
@@ -796,6 +802,14 @@ class ContinuousTransport:
         if hasattr(self.env.config, "n_law_gradient"):
             return self.env.config.n_law_gradient
         return getattr(self.env.config, "n_logit_gradient", 10)
+
+    @property
+    def n_law_particles_per_shift(self):
+        return max(1, self.n_law_gradient // max(2 * self.n_parameters, 1))
+
+    @property
+    def effective_n_law_gradient(self):
+        return 2 * self.n_parameters * self.n_law_particles_per_shift
 
     @property
     def n_law_particles(self):
@@ -975,7 +989,142 @@ class ContinuousTransport:
             *shape, self.coordinate_dim, dtype=self.env.dtype, device=self.env.device, generator=generator
         )
 
-    def population_coordinates(self, horizon=None, seed=None, jacobians=True):
+    def _normal_log_density(self, value, sigma):
+        return -0.5 * (value / sigma).square() - math.log(sigma) - 0.5 * math.log(2.0 * math.pi)
+
+    def sample_transport_randomizers(self, shape, generator):
+        """Draw the continuous-state randomizer R=(Q,A,B) in encoded form.
+
+        The returned tensor uses the same packing as the mixture coordinate, but
+        its entries parameterize the random target mixture: softmax logits for Q,
+        target means A, and target log standard deviations for sqrt(B). The
+        transport map below converts these target parameters into the actual
+        perturbed mixture parameters.
+        """
+        shape = tuple(shape)
+        beta_dim = self.config.n_components - 1
+        pieces = []
+        if beta_dim:
+            pieces.append(
+                self.config.weight_randomizer_sigma
+                * torch.randn(
+                    *shape,
+                    beta_dim,
+                    dtype=self.env.dtype,
+                    device=self.env.device,
+                    generator=generator,
+                )
+            )
+
+        pieces.append(
+            self.config.mean_randomizer_sigma
+            * torch.randn(
+                *shape,
+                self.config.n_components * self.state_dim,
+                dtype=self.env.dtype,
+                device=self.env.device,
+                generator=generator,
+            )
+        )
+        pieces.append(
+            self.config.log_scale_randomizer_sigma
+            * torch.randn(
+                *shape,
+                self.config.n_components * self.mixture.scale_dim,
+                dtype=self.env.dtype,
+                device=self.env.device,
+                generator=generator,
+            )
+        )
+        return torch.cat(pieces, dim=-1)
+
+    def transport_coordinate(self, coordinate, randomizer, scale):
+        """Apply the Gaussian-mixture transport perturbation from the reference.
+
+        The current implementation supports the one-dimensional continuous
+        benchmarks in this repository. For d=1, the Wasserstein geodesic between
+        Gaussian components moves standard deviations linearly.
+        """
+        if self.state_dim != 1:
+            raise NotImplementedError("Continuous transport randomization currently supports one-dimensional states.")
+
+        target_beta, target_means, target_scales = self.mixture.unpack(randomizer)
+        source_weights, source_means, source_scale_tril = self.mixture.decode(coordinate)
+        target_weights = self.mixture.weights(target_beta)
+        target_std = torch.exp(target_scales[..., :, 0])
+        source_std = source_scale_tril[..., :, 0, 0]
+
+        perturbed_weights = (1.0 - scale) * source_weights + scale * target_weights
+        perturbed_means = (1.0 - scale) * source_means + scale * target_means
+        perturbed_std = (1.0 - scale) * source_std + scale * target_std
+        perturbed_scale_tril = torch.zeros(
+            perturbed_std.shape + (1, 1),
+            dtype=perturbed_std.dtype,
+            device=perturbed_std.device,
+        )
+        perturbed_scale_tril[..., 0, 0] = perturbed_std
+        return self.mixture.encode(perturbed_weights, perturbed_means, perturbed_scale_tril)
+
+    def transport_log_density(self, perturbed_coordinate, coordinate, scale):
+        """log h^scale(y | z) for the implemented one-dimensional randomizer."""
+        if self.state_dim != 1:
+            raise NotImplementedError("Continuous transport density currently supports one-dimensional states.")
+        if scale <= 0.0 or scale >= 1.0:
+            raise ValueError("The transport density score is defined for scale in (0, 1).")
+
+        tiny = torch.finfo(perturbed_coordinate.dtype).tiny
+        beta_y, means_y, scales_y = self.mixture.unpack(perturbed_coordinate)
+        beta_z, means_z, scales_z = self.mixture.unpack(coordinate)
+
+        log_density = torch.zeros(perturbed_coordinate.shape[:-1], dtype=perturbed_coordinate.dtype, device=perturbed_coordinate.device)
+        if self.config.n_components > 1:
+            weights_y = self.mixture.weights(beta_y).clamp_min(tiny)
+            weights_z = self.mixture.weights(beta_z)
+            target_weights = ((weights_y - (1.0 - scale) * weights_z) / scale).clamp_min(tiny)
+            target_beta = torch.log(target_weights[..., :-1]) - torch.log(target_weights[..., -1:])
+            log_density = log_density + self._normal_log_density(
+                target_beta,
+                self.config.weight_randomizer_sigma,
+            ).sum(dim=-1)
+            log_jacobian = (
+                torch.log(weights_y).sum(dim=-1)
+                - torch.log(target_weights).sum(dim=-1)
+                - (self.config.n_components - 1) * math.log(scale)
+            )
+            log_density = log_density + log_jacobian
+
+        target_means = (means_y - (1.0 - scale) * means_z) / scale
+        log_density = log_density + self._normal_log_density(
+            target_means,
+            self.config.mean_randomizer_sigma,
+        ).sum(dim=(-2, -1))
+        mean_dim = target_means.shape[-2] * target_means.shape[-1]
+        log_density = log_density - mean_dim * math.log(scale)
+
+        y_std = torch.exp(scales_y[..., :, 0])
+        z_std = torch.exp(scales_z[..., :, 0])
+        target_std = (y_std - (1.0 - scale) * z_std).clamp_min(tiny) / scale
+        target_log_std = torch.log(target_std)
+        log_density = log_density + self._normal_log_density(
+            target_log_std,
+            self.config.log_scale_randomizer_sigma,
+        ).sum(dim=-1)
+        log_density = log_density + (
+            torch.log(y_std.clamp_min(tiny)) - torch.log((y_std - (1.0 - scale) * z_std).clamp_min(tiny))
+        ).sum(dim=-1)
+        return log_density
+
+    def transport_scores(self, perturbed_coordinates, coordinate, scale):
+        """Score s^scale(y, z)=grad_z log h^scale(y | z)."""
+        if perturbed_coordinates.ndim == 1:
+            return torch.func.grad(lambda base: self.transport_log_density(perturbed_coordinates, base, scale))(coordinate)
+
+        def score_one(perturbed):
+            return torch.func.grad(lambda base: self.transport_log_density(perturbed, base, scale))(coordinate)
+
+        return torch.func.vmap(score_one)(perturbed_coordinates)
+
+    def population_coordinates(self, horizon=None, seed=None, jacobians=True, n_particles=None, update_cache=True):
         """Fit the mixture coordinate along the represented flow.
 
         Returns the coordinates z_0, ..., z_T and, when requested, the empirical
@@ -990,7 +1139,8 @@ class ContinuousTransport:
 
         generator = torch.Generator(device=self.env.device)
         generator.manual_seed(self.config.seed if seed is None else seed)
-        states = self.env.sample_initial(self.n_population_particles, generator)
+        n_particles = self.n_population_particles if n_particles is None else n_particles
+        states = self.env.sample_initial(n_particles, generator)
 
         coordinates = []
         score_jacobians = []
@@ -1002,7 +1152,7 @@ class ContinuousTransport:
             # time otherwise. This is what keeps the fitted coordinate on the
             # same local root of the likelihood equation as theta moves, and it
             # starts EM from a nearly converged fit after the first update.
-            previous = self.fitted_coordinates
+            previous = self.fitted_coordinates if update_cache else None
             warm_start = previous[t] if previous is not None and t < len(previous) else coordinate
             coordinate = self.mixture.fit(
                 particles,
@@ -1021,7 +1171,8 @@ class ContinuousTransport:
             with torch.no_grad():
                 states = self.sample_next_states_for_population(t, states, law, actions, generator)
 
-        self.fitted_coordinates = coordinates
+        if update_cache:
+            self.fitted_coordinates = coordinates
         return coordinates, score_jacobians
 
     def exact_population_coordinates(self, horizon, jacobians=True):
@@ -1113,66 +1264,84 @@ class ContinuousTransport:
                 pieces.append(grad.reshape(n_outputs, -1))
         return torch.cat(pieces, dim=1).reshape(self.horizon, score_dim, self.n_parameters)
 
-    def estimate_coordinate_sensitivities(self, coordinates, score_jacobians, seed, eta=None):
-        """Model-free estimate of D_t = grad_theta z_t from n auxiliary trajectories.
+    def shifted_policy(self, parameter_index, amount):
+        """Copy the current policy and shift one flattened parameter."""
+        if isinstance(self.policy, nn.Module):
+            shifted = copy.deepcopy(self.policy)
+            shifted.to(self.env.device)
+            offset = 0
+            for parameter in shifted.parameters():
+                next_offset = offset + parameter.numel()
+                if offset <= parameter_index < next_offset:
+                    with torch.no_grad():
+                        parameter.reshape(-1)[parameter_index - offset] += amount
+                    return shifted
+                offset = next_offset
+            raise IndexError("Policy parameter index out of range.")
 
-        The fitted coordinate solves E[psi_K(X_t, z_t)] = 0. Differentiating that
-        finite-dimensional equation in theta gives D_t = -A_t^{-1} B_t, where B_t
-        is the covariance between the mixture score at time t and the score of the
-        trajectory law up to time t. The latter is the policy score plus the
-        coordinate score eta^{-1} D_s^T U_s of the earlier perturbations, so the
-        recursion consumes the sensitivities already estimated at times s < t and
-        starts from D_0 = 0.
+        shifted = self.policy.detach().clone()
+        shifted.reshape(-1)[parameter_index] += amount
+        return shifted
+
+    def coordinates_under_policy(self, policy, seed, n_particles):
+        """Fit the represented flow under a temporary policy without changing caches."""
+        current_policy = self.policy
+        current_cache = self.fitted_coordinates
+        try:
+            self.policy = policy
+            self.fitted_coordinates = None
+            coordinates, _ = self.population_coordinates(
+                seed=seed,
+                jacobians=False,
+                n_particles=n_particles,
+                update_cache=False,
+            )
+            return coordinates
+        finally:
+            self.policy = current_policy
+            self.fitted_coordinates = current_cache
+
+    def estimate_coordinate_sensitivities(self, coordinates, score_jacobians=None, seed=0, eta=None):
+        """Estimate D_t = grad_theta z_t by centered policy differences.
+
+        This is the continuous-state auxiliary estimator of the reference. The
+        configured n_law_gradient is interpreted as the total auxiliary particle
+        budget n = 2 d_theta n0, rounded down to at least one particle per shift.
         """
-        generator = torch.Generator(device=self.env.device)
-        generator.manual_seed(seed)
         eta = self.eta if eta is None else eta
-        n_trajectories = self.n_law_gradient
-        score_dim = self.coordinate_dim
+        if eta <= 0.0:
+            raise ValueError("Continuous transport requires eta > 0 for centered policy differences.")
 
+        n_per_shift = self.n_law_particles_per_shift
         sensitivities = [
-            torch.zeros(score_dim, self.n_parameters, dtype=self.env.dtype, device=self.env.device)
+            torch.zeros(self.coordinate_dim, self.n_parameters, dtype=self.env.dtype, device=self.env.device)
             for _ in range(self.horizon + 1)
         ]
         if self.horizon == 0:
             return sensitivities
 
-        states = [self.initial_states(n_trajectories, generator)]
-        action_log_probs = []
-        perturbations = []
-
-        for t in range(self.horizon):
-            perturbation = self.sample_perturbations((n_trajectories,), generator)
-            law = self.population_law(coordinates[t] + eta * perturbation)
-            action, log_prob = self.sample_actions_with_log_probs(t, states[-1], law, generator)
-            action_log_probs.append(log_prob)
-            perturbations.append(perturbation)
-
-            with torch.no_grad():
-                states.append(self.sample_next_state(t, states[-1], law, action, generator))
-
-        mixture_scores = [
-            self.mixture.score(self.particle_coordinates(state.detach()), coordinate)
-            for state, coordinate in zip(states, coordinates)
-        ]
-        policy_score_terms = self.batched_log_prob_gradients(action_log_probs, mixture_scores, score_dim)
-
-        # The trajectory score is a prefix sum over time: each target_t only adds
-        # the term for the step just completed, whose sensitivity was finalized on
-        # the previous iteration.
-        coordinate_score = torch.zeros(
-            n_trajectories, self.n_parameters, dtype=self.env.dtype, device=self.env.device
-        )
-        for target_t in range(1, self.horizon + 1):
-            coordinate_score = coordinate_score + perturbations[target_t - 1] @ sensitivities[target_t - 1] / eta
-            b = mixture_scores[target_t].T @ coordinate_score + policy_score_terms[target_t - 1]
-            sensitivities[target_t] = self.solve_sensitivity(score_jacobians[target_t], b / n_trajectories)
+        for parameter_index in range(self.n_parameters):
+            plus_policy = self.shifted_policy(parameter_index, eta)
+            minus_policy = self.shifted_policy(parameter_index, -eta)
+            plus = self.coordinates_under_policy(
+                plus_policy,
+                seed + 10_000 * parameter_index + 1,
+                n_per_shift,
+            )
+            minus = self.coordinates_under_policy(
+                minus_policy,
+                seed + 10_000 * parameter_index + 2,
+                n_per_shift,
+            )
+            for t in range(1, self.horizon + 1):
+                sensitivities[t][:, parameter_index] = (plus[t] - minus[t]) / (2.0 * eta)
 
         return sensitivities
 
-    def coordinate_score(self, perturbation, sensitivity, lambda_):
-        """Mean-field correction D_t^T U_t / lambda of one perturbed population argument."""
-        return perturbation @ sensitivity / lambda_
+    def coordinate_score(self, perturbed_coordinate, coordinate, sensitivity, lambda_):
+        """Mean-field correction D_t^T s_t^lambda(y, z)."""
+        score = self.transport_scores(perturbed_coordinate, coordinate, lambda_)
+        return score @ sensitivity
 
     def trajectory_gradient(self, coordinates, sensitivities, seed, lambda_=None):
         generator = torch.Generator(device=self.env.device)
@@ -1188,11 +1357,12 @@ class ContinuousTransport:
         for t in range(self.horizon):
             law = self.population_law(coordinates[t])
             base_action = self.sample_action(t, base_state, law, generator)
-            perturbation = self.sample_perturbations((), generator)
-            perturbed_law = self.population_law(coordinates[t] + lambda_ * perturbation)
+            randomizer = self.sample_transport_randomizers((), generator)
+            perturbed_coordinate = self.transport_coordinate(coordinates[t], randomizer, lambda_)
+            perturbed_law = self.population_law(perturbed_coordinate)
             action = self.sample_action(t, state, perturbed_law, generator)
 
-            law_score = self.coordinate_score(perturbation, sensitivities[t], lambda_)
+            law_score = self.coordinate_score(perturbed_coordinate, coordinates[t], sensitivities[t], lambda_)
             action_score = self.log_prob_gradient(t, state, perturbed_law, action)
             score_terms.append(law_score + action_score)
             base_rewards.append(self.env.reward(base_state, law, base_action))
@@ -1203,11 +1373,14 @@ class ContinuousTransport:
                 state = self.sample_next_state(t, state, perturbed_law, action, generator)
 
         terminal_law = self.population_law(coordinates[-1])
-        perturbation = self.sample_perturbations((), generator)
-        perturbed_terminal_law = self.population_law(coordinates[-1] + lambda_ * perturbation)
+        randomizer = self.sample_transport_randomizers((), generator)
+        perturbed_terminal_coordinate = self.transport_coordinate(coordinates[-1], randomizer, lambda_)
+        perturbed_terminal_law = self.population_law(perturbed_terminal_coordinate)
         terminal_reward = self.env.terminal_reward(state, perturbed_terminal_law)
         base_terminal_reward = self.env.terminal_reward(base_state, terminal_law)
-        score_terms.append(self.coordinate_score(perturbation, sensitivities[-1], lambda_))
+        score_terms.append(
+            self.coordinate_score(perturbed_terminal_coordinate, coordinates[-1], sensitivities[-1], lambda_)
+        )
 
         returns = self.discounted_returns(rewards, terminal_reward)
         base_return = self.discounted_returns(base_rewards, base_terminal_reward)[0]
@@ -1223,16 +1396,17 @@ class ContinuousTransport:
         base_rewards = []
         rewards = []
         action_log_probs = []
-        perturbations = []
+        perturbed_coordinates = []
 
         for t in range(self.horizon):
             law = self.population_law(coordinates[t])
             base_action, _ = self.sample_actions_with_log_probs(t, base_states, law, generator)
-            perturbation = self.sample_perturbations((self.n_particles,), generator)
-            perturbed_law = self.population_law(coordinates[t] + lambda_ * perturbation)
+            randomizer = self.sample_transport_randomizers((self.n_particles,), generator)
+            perturbed_coordinate = self.transport_coordinate(coordinates[t], randomizer, lambda_)
+            perturbed_law = self.population_law(perturbed_coordinate)
             action, log_prob = self.sample_actions_with_log_probs(t, states, perturbed_law, generator)
 
-            perturbations.append(perturbation)
+            perturbed_coordinates.append(perturbed_coordinate)
             action_log_probs.append(log_prob)
             base_rewards.append(self.env.reward(base_states, law, base_action))
             rewards.append(self.env.reward(states, perturbed_law, action))
@@ -1242,39 +1416,46 @@ class ContinuousTransport:
                 states = self.sample_next_state(t, states, perturbed_law, action, generator)
 
         terminal_law = self.population_law(coordinates[-1])
-        perturbation = self.sample_perturbations((self.n_particles,), generator)
-        perturbed_terminal_law = self.population_law(coordinates[-1] + lambda_ * perturbation)
+        randomizer = self.sample_transport_randomizers((self.n_particles,), generator)
+        perturbed_terminal_coordinate = self.transport_coordinate(coordinates[-1], randomizer, lambda_)
+        perturbed_terminal_law = self.population_law(perturbed_terminal_coordinate)
         terminal_reward = self.env.terminal_reward(states, perturbed_terminal_law)
         base_terminal_reward = self.env.terminal_reward(base_states, terminal_law)
-        perturbations.append(perturbation)
+        perturbed_coordinates.append(perturbed_terminal_coordinate)
 
         returns = torch.stack(self.discounted_returns(rewards, terminal_reward))
         base_return = self.discounted_returns(base_rewards, base_terminal_reward)[0]
         advantages = returns - returns.mean(dim=1, keepdim=True) if self.config.baseline else returns
         action_gradient = self.flat_grad((torch.stack(action_log_probs) * advantages[:-1].detach()).sum())
-        return action_gradient, advantages.detach(), perturbations, base_return.mean()
+        return action_gradient, advantages.detach(), perturbed_coordinates, base_return.mean()
 
     def combine_batched_trajectory_components(
-        self, action_gradient, weights, perturbations, sensitivities, lambda_=None
+        self, action_gradient, weights, perturbed_coordinates, sensitivities, coordinates, lambda_=None
     ):
         lambda_ = self.lambda_ if lambda_ is None else lambda_
         law_gradient = torch.zeros(self.n_parameters, dtype=self.env.dtype, device=self.env.device)
-        for index, perturbation in enumerate(perturbations):
-            law_score = self.coordinate_score(perturbation, sensitivities[index], lambda_)
+        for index, perturbed_coordinate in enumerate(perturbed_coordinates):
+            law_score = self.coordinate_score(perturbed_coordinate, coordinates[index], sensitivities[index], lambda_)
             law_gradient = law_gradient + (law_score * weights[index].unsqueeze(-1)).sum(dim=0)
         return (action_gradient + law_gradient) / self.n_particles
 
     def batched_trajectory_gradient(self, coordinates, sensitivities, seed):
-        action_gradient, weights, perturbations, base_return = self.batched_trajectory_components(coordinates, seed)
-        gradient = self.combine_batched_trajectory_components(action_gradient, weights, perturbations, sensitivities)
+        action_gradient, weights, perturbed_coordinates, base_return = self.batched_trajectory_components(coordinates, seed)
+        gradient = self.combine_batched_trajectory_components(
+            action_gradient,
+            weights,
+            perturbed_coordinates,
+            sensitivities,
+            coordinates,
+        )
         return gradient, base_return
 
     def estimate_gradient(self, seed):
         self.sensitivity_fallbacks = 0
-        coordinates, score_jacobians = self.population_coordinates(seed=seed + 20_000)
+        coordinates, _ = self.population_coordinates(seed=seed + 20_000, jacobians=False)
 
         if self.config.reuse_state_gradient:
-            sensitivities = self.estimate_coordinate_sensitivities(coordinates, score_jacobians, seed + 10_000)
+            sensitivities = self.estimate_coordinate_sensitivities(coordinates, seed=seed + 10_000)
             return self.batched_trajectory_gradient(coordinates, sensitivities, seed)
 
         gradient = torch.zeros(self.n_parameters, dtype=self.env.dtype, device=self.env.device)
@@ -1284,7 +1465,8 @@ class ContinuousTransport:
 
         for particle in range(self.n_particles):
             sensitivities = self.estimate_coordinate_sensitivities(
-                coordinates, score_jacobians, seed + 10_000 + particle
+                coordinates,
+                seed=seed + 10_000 + particle,
             )
             score, trajectory_returns, objective = self.trajectory_gradient(
                 coordinates, sensitivities, seed + particle
@@ -1444,23 +1626,28 @@ class AdaptiveContinuousTransport(ContinuousTransport):
         g_mm = []
         for replication in range(config.adaptive_replications):
             base_seed = seed + replication * 100_000
-            coordinates, score_jacobians = self.population_coordinates(seed=base_seed + 20_000)
+            coordinates, _ = self.population_coordinates(seed=base_seed + 20_000, jacobians=False)
             sensitivities_plus = self.estimate_coordinate_sensitivities(
-                coordinates, score_jacobians, base_seed + 10_000, eta=eta_plus
+                coordinates,
+                seed=base_seed + 10_000,
+                eta=eta_plus,
             )
             sensitivities_minus = self.estimate_coordinate_sensitivities(
-                coordinates, score_jacobians, base_seed + 40_000, eta=eta_minus
+                coordinates,
+                seed=base_seed + 40_000,
+                eta=eta_minus,
             )
             components_plus = self.batched_trajectory_components(coordinates, base_seed, lambda_=lambda_plus)
             components_minus = self.batched_trajectory_components(coordinates, base_seed + 50_000, lambda_=lambda_minus)
 
-            action_gradient, weights, perturbations, _ = components_plus
+            action_gradient, weights, perturbed_coordinates, _ = components_plus
             g_pp.append(
                 self.combine_batched_trajectory_components(
                     action_gradient,
                     weights,
-                    perturbations,
+                    perturbed_coordinates,
                     sensitivities_plus,
+                    coordinates,
                     lambda_=lambda_plus,
                 ).detach()
             )
@@ -1468,19 +1655,21 @@ class AdaptiveContinuousTransport(ContinuousTransport):
                 self.combine_batched_trajectory_components(
                     action_gradient,
                     weights,
-                    perturbations,
+                    perturbed_coordinates,
                     sensitivities_minus,
+                    coordinates,
                     lambda_=lambda_plus,
                 ).detach()
             )
 
-            action_gradient, weights, perturbations, _ = components_minus
+            action_gradient, weights, perturbed_coordinates, _ = components_minus
             g_mp.append(
                 self.combine_batched_trajectory_components(
                     action_gradient,
                     weights,
-                    perturbations,
+                    perturbed_coordinates,
                     sensitivities_plus,
+                    coordinates,
                     lambda_=lambda_minus,
                 ).detach()
             )
@@ -1488,8 +1677,9 @@ class AdaptiveContinuousTransport(ContinuousTransport):
                 self.combine_batched_trajectory_components(
                     action_gradient,
                     weights,
-                    perturbations,
+                    perturbed_coordinates,
                     sensitivities_minus,
+                    coordinates,
                     lambda_=lambda_minus,
                 ).detach()
             )

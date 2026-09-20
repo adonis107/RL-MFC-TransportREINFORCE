@@ -18,19 +18,21 @@ from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 from mfc.environments import LQ, LQConfig, Portfolio, PortfolioConfig
 from mfc.algorithms.transport import ContinuousTransport, ContinuousTransportConfig
 from mfc.visualization.diagnostics import reward_gradient
 from mfc.visualization.tables import save_table
+import run as run_plan
 
 SPECS = {
     "lq": (LQ, LQConfig, dict(horizon=20, n_particles=111, n_law_gradient=160,
                               n_flow_particles=150, n_components=3),
-           (0.025, 0.05, 0.1, 0.2, 0.4, 0.8)),
+           run_plan.bound_lambda_grid("lq")),
     "portfolio": (Portfolio, PortfolioConfig, dict(horizon=10, n_particles=211, n_law_gradient=700,
                                                    n_flow_particles=100, n_components=1),
-                  (0.0125, 0.025, 0.05, 0.1, 0.2, 0.4)),
+                  run_plan.bound_lambda_grid("portfolio")),
 }
 
 
@@ -48,9 +50,10 @@ def main():
         exact = reward_gradient(env, policy, lambda_=0.0).detach().reshape(-1)
         norm = exact.norm()
         print(f"{name}: ||grad J|| = {float(norm):.4f}", flush=True)
+        eta = run_plan.asymptotic_auxiliary_eta(name)
         for lambda_ in lambdas:
             estimator = ContinuousTransport(env, policy=policy, config=ContinuousTransportConfig(
-                lambda_=lambda_, eta=0.85, flow="particle", seed=args.seed, **common))
+                lambda_=lambda_, eta=eta, flow="particle", seed=args.seed, **common))
             estimates = torch.stack([
                 estimator.estimate_gradient(index * 7919)[0].detach().reshape(-1)
                 for index in range(args.replications)])

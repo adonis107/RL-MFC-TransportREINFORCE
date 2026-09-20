@@ -8,6 +8,9 @@ from .flows import final_policy_probabilities
 from .io import load_env_and_policy, run_label, runs_dataframe
 
 
+CONTINUOUS_TRANSPORT_ENVS = {"lq", "portfolio", "kuramoto"}
+
+
 def optimize_exact_policy(env, lambda_):
     if not hasattr(env, "objective") or not hasattr(env, "optimal_policy"):
         raise NotImplementedError("Exact policy optimization requires objective and optimal_policy.")
@@ -105,10 +108,14 @@ def objective_table(runs):
         if hasattr(env, "objective"):
             row["objective_convention"] = "cost" if metadata["env"] == "lq" else "reward"
             theta = policy if not isinstance(policy, torch.nn.Module) else None
+            analytic_perturbation = not (
+                metadata["algorithm"] in {"transport", "adaptive_transport"}
+                and metadata["env"] in CONTINUOUS_TRANSPORT_ENVS
+            )
             if theta is not None:
                 with torch.no_grad():
                     row["J0"] = float(env.objective(theta, lambda_=0.0).detach().cpu())
-                    if metadata["perturbation"] is not None:
+                    if metadata["perturbation"] is not None and analytic_perturbation:
                         row["Jlambda"] = float(env.objective(theta, lambda_=metadata["perturbation"]).detach().cpu())
                     if hasattr(env, "optimal_policy"):
                         try:
@@ -116,7 +123,7 @@ def objective_table(runs):
                             row["J0_star"] = float(env.objective(optimal, lambda_=0.0).detach().cpu())
                         except NotImplementedError:
                             pass
-                if metadata["perturbation"] is not None and hasattr(env, "optimal_policy"):
+                if metadata["perturbation"] is not None and analytic_perturbation and hasattr(env, "optimal_policy"):
                     key = (
                         metadata["env"],
                         metadata["horizon"],

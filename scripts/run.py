@@ -7,6 +7,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN = ROOT / "scripts" / "train.py"
 
+PRIMARY_ENVS = ["twostate", "cybersecurity", "distribution", "advertising", "lq", "portfolio"]
+DISCRETE_ENVS = {"twostate", "cybersecurity", "distribution", "advertising"}
+CONTINUOUS_ENVS = {"lq", "portfolio"}
+
 DISCRETE_REFERENCE = {
     "twostate": {"n_particles": 200, "n_gradient": 10},
     "cybersecurity": {"n_particles": 200, "n_gradient": 1},
@@ -27,32 +31,131 @@ MF_REINFORCE_SPLITS = {
 CONTINUOUS_REFERENCE = {
     "lq": {"n_particles": 200, "n_gradient": 1},
     "portfolio": {"n_particles": 500, "n_gradient": 1},
-    "kuramoto": {"n_particles": 500, "n_gradient": 1},
 }
 
 CONTINUOUS_COMPONENTS = {
     "lq": (1, 2, 3),
     "portfolio": (1,),
-    "kuramoto": (1, 2, 3),
 }
 
-TRANSPORT_LAMBDAS = (0.05, 0.1, 0.2, 0.4, 0.8)
-TWOSTATE_TRANSPORT_ETAS = (0.4, 0.6, 0.85, 0.95)
-DEFAULT_TRANSPORT_ETA = 0.85
-TRANSPORT_AUXILIARY_GRADIENTS = {
-    "cybersecurity": 51,
-    "distribution": 280,
-    "advertising": 65,
+# Transport allocation from the ICLR reference table. Here M is the population
+# block, n the auxiliary sensitivity block, and B the main trajectory block.
+TRANSPORT_ALLOCATIONS = {
+    "twostate": {
+        "horizon": 5,
+        "M": 0,
+        "n": 12,
+        "B": 248,
+        "updates": 10_000,
+        "lr": 1e-3,
+        "simplex_sigma": 0.75,
+    },
+    "cybersecurity": {
+        "horizon": 3,
+        "M": 0,
+        "n": 51,
+        "B": 153,
+        "updates": 20_000,
+        "lr": 1e-3,
+        "simplex_sigma": 1.0,
+    },
+    "distribution": {
+        "horizon": 5,
+        "M": 0,
+        "n": 280,
+        "B": 280,
+        "updates": 30_000,
+        "lr": 1e-4,
+        "simplex_sigma": 0.5,
+    },
+    "advertising": {
+        "horizon": 5,
+        "M": 0,
+        "n": 65,
+        "B": 195,
+        "updates": 10_000,
+        "lr": 1e-3,
+        "simplex_sigma": 1.0,
+    },
+    "lq": {
+        "horizon": 20,
+        "M": 150,
+        "n": 160,
+        "B": 111,
+        "updates": 10_000,
+        "lr": 1e-3,
+        "d_theta": 40,
+    },
+    "portfolio": {
+        "horizon": 10,
+        "M": 100,
+        "n": 700,
+        "B": 211,
+        "updates": 50_000,
+        "lr": 1e-2,
+        "d_theta": 20,
+    },
 }
 
-CONTINUOUS_SPLIT = {
-    "lq": {"population": 150, "auxiliary": 160},
-    "portfolio": {"population": 100, "auxiliary": 700},
-    "kuramoto": {"population": 200, "auxiliary": 400},
-}
+BOUND_LAMBDA_MULTIPLIERS = (0.5, 1.0, 2.0)
 
 
-def job(env, algorithm, horizon, flow="exact", perturbation=None, eta=None, n_components=None):
+def round_scale(value):
+    """Stable command-line representation for bound-derived scales."""
+    return float(f"{value:.6g}")
+
+
+def effective_auxiliary_samples(env):
+    allocation = TRANSPORT_ALLOCATIONS[env]
+    auxiliary = allocation["n"]
+    if env in CONTINUOUS_ENVS:
+        shifts = 2 * allocation["d_theta"]
+        return shifts * max(1, auxiliary // shifts)
+    return auxiliary
+
+
+def asymptotic_auxiliary_eta(env):
+    exponent = 1.0 / 6.0 if env in CONTINUOUS_ENVS else 1.0 / 4.0
+    return round_scale(effective_auxiliary_samples(env) ** (-exponent))
+
+
+def asymptotic_main_lambda(env, multiplier=1.0):
+    return round_scale(multiplier * TRANSPORT_ALLOCATIONS[env]["B"] ** (-0.25))
+
+
+def bound_lambda_grid(env):
+    return tuple(asymptotic_main_lambda(env, multiplier) for multiplier in BOUND_LAMBDA_MULTIPLIERS)
+
+
+def transport_per_step_budget(env):
+    allocation = TRANSPORT_ALLOCATIONS[env]
+    return allocation["M"] + allocation["n"] + allocation["B"]
+
+
+def transport_job(env, flow="exact", lambda_=None, n_components=None):
+    allocation = TRANSPORT_ALLOCATIONS[env]
+    return job(
+        env,
+        "transport",
+        allocation["horizon"],
+        flow=flow,
+        perturbation=asymptotic_main_lambda(env) if lambda_ is None else lambda_,
+        eta=asymptotic_auxiliary_eta(env),
+        n_components=n_components,
+        simplex_sigma=allocation.get("simplex_sigma"),
+    )
+
+
+def job(
+    env,
+    algorithm,
+    horizon,
+    flow="exact",
+    perturbation=None,
+    eta=None,
+    n_components=None,
+    simplex_sigma=None,
+):
     return {
         "env": env,
         "algorithm": algorithm,
@@ -61,69 +164,58 @@ def job(env, algorithm, horizon, flow="exact", perturbation=None, eta=None, n_co
         "perturbation": perturbation,
         "eta": eta,
         "n_components": n_components,
+        "simplex_sigma": simplex_sigma,
     }
 
 
-def continuous_transport_jobs(env, horizon, lambdas, components=None):
-    """Transport arm of a continuous benchmark: the perturbation grid times the mixture sizes."""
+def continuous_transport_jobs(env, components=None):
+    """Continuous transport arm: bound-scale lambda multipliers times mixture sizes."""
     components = CONTINUOUS_COMPONENTS[env] if components is None else components
     return [
-        job(env, "transport", horizon, flow="particle", perturbation=lambda_,
-            eta=DEFAULT_TRANSPORT_ETA, n_components=k)
+        transport_job(env, flow="particle", lambda_=lambda_, n_components=k)
         for k in components
-        for lambda_ in lambdas
+        for lambda_ in bound_lambda_grid(env)
     ]
 
 
 def experiment_plan(env):
+    if env not in TRANSPORT_ALLOCATIONS:
+        raise ValueError(f"Unknown environment: {env}")
+
+    allocation = TRANSPORT_ALLOCATIONS[env]
+    horizon = allocation["horizon"]
+
     if env == "twostate":
-        jobs = []
-        # T = 5 only: the shorter horizon separates the estimators too weakly to add anything.
-        for horizon in (5,):
-            jobs.append(job(env, "reinforce", horizon))
-            for flow in ("exact", "particle"):
-                jobs.append(job(env, "mfreinforce", horizon, flow=flow, perturbation=0.2))
-                for lambda_ in TRANSPORT_LAMBDAS:
-                    for eta in TWOSTATE_TRANSPORT_ETAS:
-                        jobs.append(job(env, "transport", horizon, flow=flow, perturbation=lambda_, eta=eta))
+        jobs = [job(env, "reinforce", horizon)]
+        for flow in ("exact", "particle"):
+            jobs.append(job(env, "mfreinforce", horizon, flow=flow, perturbation=0.2))
+            jobs.extend(transport_job(env, flow=flow, lambda_=lambda_) for lambda_ in bound_lambda_grid(env))
         return jobs
 
     if env == "cybersecurity":
-        jobs = [job(env, "reinforce", 3)]
-        jobs.append(job(env, "mfreinforce", 3, perturbation=1.0))
-        jobs.extend(
-            job(env, "transport", 3, perturbation=lambda_, eta=DEFAULT_TRANSPORT_ETA)
-            for lambda_ in (0.1, 0.2, 0.4)
-        )
-        jobs.append(job(env, "mfqlearning", 3))
+        jobs = [job(env, "reinforce", horizon)]
+        jobs.append(job(env, "mfreinforce", horizon, perturbation=1.0))
+        jobs.extend(transport_job(env, lambda_=lambda_) for lambda_ in bound_lambda_grid(env))
+        jobs.append(job(env, "mfqlearning", horizon))
         return jobs
 
     if env == "distribution":
-        jobs = [job(env, "reinforce", 5)]
-        jobs.append(job(env, "mfreinforce", 5, perturbation=2.0))
-        jobs.extend(
-            job(env, "transport", 5, perturbation=lambda_, eta=DEFAULT_TRANSPORT_ETA)
-            for lambda_ in (0.1, 0.2, 0.4)
-        )
+        jobs = [job(env, "reinforce", horizon)]
+        jobs.append(job(env, "mfreinforce", horizon, perturbation=2.0))
+        jobs.extend(transport_job(env, lambda_=lambda_) for lambda_ in bound_lambda_grid(env))
         return jobs
 
     if env == "advertising":
-        jobs = [job(env, "reinforce", 5)]
-        jobs.append(job(env, "mfreinforce", 5, perturbation=1.0))
-        jobs.extend(
-            job(env, "transport", 5, perturbation=lambda_, eta=DEFAULT_TRANSPORT_ETA)
-            for lambda_ in (0.1, 0.2, 0.4)
-        )
+        jobs = [job(env, "reinforce", horizon)]
+        jobs.append(job(env, "mfreinforce", horizon, perturbation=1.0))
+        jobs.extend(transport_job(env, lambda_=lambda_) for lambda_ in bound_lambda_grid(env))
         return jobs
 
     if env == "lq":
-        return [job(env, "reinforce", 20)] + continuous_transport_jobs(env, 20, TRANSPORT_LAMBDAS)
+        return [job(env, "reinforce", horizon)] + continuous_transport_jobs(env)
 
     if env == "portfolio":
-        return [job(env, "reinforce", 10)] + continuous_transport_jobs(env, 10, (0.025, 0.05, 0.1, 0.2, 0.4))
-
-    if env == "kuramoto":
-        return [job(env, "reinforce", 20)] + continuous_transport_jobs(env, 20, TRANSPORT_LAMBDAS)
+        return [job(env, "reinforce", horizon)] + continuous_transport_jobs(env)
 
     raise ValueError(f"Unknown environment: {env}")
 
@@ -135,6 +227,8 @@ def continuous_budget(env, horizon):
     block, reading the law off its own particles, so it spends all of them on
     trajectories and the two arms cost the same T(M + n + B).
     """
+    if env in TRANSPORT_ALLOCATIONS:
+        return transport_per_step_budget(env)
     return round(mf_reference_cost(env, horizon) / horizon) + CONTINUOUS_REFERENCE[env]["n_particles"]
 
 
@@ -157,45 +251,38 @@ def fair_run_parameters(job_spec):
     env = job_spec["env"]
     algorithm = job_spec["algorithm"]
     horizon = job_spec["horizon"]
+    allocation = TRANSPORT_ALLOCATIONS.get(env)
     reference = reference_budget(env)
     ref_particles = reference["n_particles"]
     ref_gradient = reference["n_gradient"]
     base_cost = mf_reference_cost(env, horizon)
 
     parameters = {}
+    if allocation is not None:
+        parameters["n_train"] = allocation["updates"]
+        parameters["lr"] = allocation["lr"]
+
     if algorithm == "mfreinforce":
         selected = MF_REINFORCE_SPLITS.get(env, {})
         parameters["n_particles"] = selected.get("n_particles", ref_particles)
         parameters["n_logit_gradient"] = selected.get("n_logit_gradient", ref_gradient)
     elif algorithm == "reinforce":
-        parameters["n_particles"] = (
-            continuous_budget(env, horizon)
-            if env in CONTINUOUS_REFERENCE
-            else max(1, round(base_cost / horizon))
-        )
-    elif algorithm == "transport" and env in CONTINUOUS_SPLIT:
-        split = CONTINUOUS_SPLIT[env]
-        parameters["n_flow_particles"] = split["population"]
-        parameters["n_law_gradient"] = split["auxiliary"]
-        parameters["n_particles"] = max(
-            1, continuous_budget(env, horizon) - split["population"] - split["auxiliary"]
-        )
-    elif algorithm == "transport":
-        per_step_budget = base_cost / horizon
-        auxiliary_gradient = TRANSPORT_AUXILIARY_GRADIENTS.get(env)
-        if auxiliary_gradient is None:
-            scale = per_step_budget / (ref_particles + ref_gradient)
-            parameters["n_particles"] = max(1, round(scale * ref_particles))
-            auxiliary_gradient = max(1, round(scale * ref_gradient))
+        if allocation is not None:
+            parameters["n_particles"] = transport_per_step_budget(env)
         else:
-            auxiliary_gradient = min(auxiliary_gradient, max(1, int(per_step_budget) - 1))
-            parameters["n_particles"] = max(1, int(per_step_budget - auxiliary_gradient))
-
-        if env in DISCRETE_REFERENCE:
-            parameters["n_logit_gradient"] = auxiliary_gradient
+            parameters["n_particles"] = (
+                continuous_budget(env, horizon)
+                if env in CONTINUOUS_REFERENCE
+                else max(1, round(base_cost / horizon))
+            )
+    elif algorithm == "transport" and allocation is not None:
+        parameters["n_particles"] = allocation["B"]
+        if env in DISCRETE_ENVS:
+            parameters["n_logit_gradient"] = allocation["n"]
         else:
-            parameters["n_law_gradient"] = auxiliary_gradient
-    elif algorithm == "mfqlearning":
+            parameters["n_flow_particles"] = allocation["M"]
+            parameters["n_law_gradient"] = allocation["n"]
+    elif algorithm == "mfqlearning" and allocation is None:
         parameters["n_train"] = round(base_cost * (reference["n_train"] if "n_train" in reference else 20_000))
 
     if (
@@ -244,7 +331,7 @@ def command_for(job_spec, seed, args):
     optional_values = {
         "--device": args.device,
         "--n-train": args.n_train if args.n_train is not None else fair_parameters.get("n_train"),
-        "--lr": args.lr,
+        "--lr": args.lr if args.lr is not None else fair_parameters.get("lr"),
         "--n-particles": args.n_particles if args.n_particles is not None else fair_parameters.get("n_particles"),
         "--n-logit-gradient": args.n_logit_gradient
         if args.n_logit_gradient is not None
@@ -258,7 +345,9 @@ def command_for(job_spec, seed, args):
         if args.n_flow_particles is not None
         else fair_parameters.get("n_flow_particles"),
         "--validation-interval": args.validation_interval,
-        "--simplex-sigma": args.simplex_sigma,
+        "--simplex-sigma": args.simplex_sigma
+        if args.simplex_sigma is not None
+        else job_spec.get("simplex_sigma"),
         "--simplex-resolution": args.simplex_resolution,
         "--q-learning-lr-power": args.q_learning_lr_power,
         "--q-learning-sampling": args.q_learning_sampling,
@@ -285,7 +374,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Launch the training grid for one environment.")
     parser.add_argument(
         "--env",
-        choices=["twostate", "cybersecurity", "distribution", "advertising", "lq", "portfolio", "kuramoto", "all"],
+        choices=PRIMARY_ENVS + ["all"],
         required=True,
     )
     parser.add_argument("--seeds", type=parse_seed_list, default=[0, 1, 2, 3, 4])
@@ -318,8 +407,7 @@ def main():
     if args.baseline and args.no_baseline:
         raise ValueError("Use at most one of --baseline and --no-baseline.")
 
-    envs = ["twostate", "cybersecurity", "distribution", "advertising", "lq", "portfolio", "kuramoto"]
-    selected_envs = envs if args.env == "all" else [args.env]
+    selected_envs = PRIMARY_ENVS if args.env == "all" else [args.env]
 
     commands = []
     for env in selected_envs:

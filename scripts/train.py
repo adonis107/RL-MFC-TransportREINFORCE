@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import json
 import time
 from dataclasses import asdict, fields, replace
@@ -69,6 +70,72 @@ def update_dataclass(config, **updates):
     return replace(config, **kept)
 
 
+def asymptotic_auxiliary_eta(env_name, auxiliary_samples):
+    """Reference MSE-bound auxiliary scale for a benchmark family."""
+    if auxiliary_samples is None:
+        return None
+    exponent = 1.0 / 6.0 if env_name in CONTINUOUS_ENVS else 1.0 / 4.0
+    return float(max(1, auxiliary_samples) ** (-exponent))
+
+
+def asymptotic_main_lambda(main_samples):
+    """Reference MSE-bound main perturbation scale, up to unknown constants."""
+    if main_samples is None:
+        return None
+    return float(max(1, main_samples) ** (-0.25))
+
+
+def configured_auxiliary_samples(args, env):
+    if args.env in DISCRETE_ENVS:
+        if args.n_logit_gradient is not None:
+            return args.n_logit_gradient
+        return getattr(env.config, "n_logit_gradient", 10)
+    if args.n_law_gradient is not None:
+        return args.n_law_gradient
+    if hasattr(env.config, "n_law_gradient"):
+        return env.config.n_law_gradient
+    return getattr(env.config, "n_logit_gradient", 10)
+
+
+def default_policy_parameter_count(env):
+    if hasattr(env, "zero_policy"):
+        return int(env.zero_policy().numel())
+
+    module = importlib.import_module(type(env).__module__)
+    policy_class = getattr(module, f"{type(env).__name__}Policy", None)
+    if policy_class is None:
+        return None
+    policy = policy_class(env.config)
+    return sum(parameter.numel() for parameter in policy.parameters())
+
+
+def effective_auxiliary_samples(args, env):
+    auxiliary = configured_auxiliary_samples(args, env)
+    if args.env not in CONTINUOUS_ENVS:
+        return auxiliary
+    parameter_count = default_policy_parameter_count(env)
+    if parameter_count is None:
+        return auxiliary
+    shifts = 2 * parameter_count
+    return shifts * max(1, auxiliary // shifts)
+
+
+def asymptotic_bound_scales(args, algorithm):
+    if args.algorithm not in TRANSPORT_ALGORITHMS:
+        return None
+    auxiliary = (
+        algorithm.n_logit_gradient
+        if isinstance(algorithm, (DiscreteTransport, AdaptiveDiscreteTransport))
+        else algorithm.effective_n_law_gradient
+    )
+    return {
+        "lambda": asymptotic_main_lambda(algorithm.n_particles),
+        "eta": asymptotic_auxiliary_eta(args.env, auxiliary),
+        "lambda_rate": "B^(-1/4)",
+        "eta_rate": "n^(-1/6)" if args.env in CONTINUOUS_ENVS else "n^(-1/4)",
+    }
+
+
 def perturbation_label(algorithm, perturbation, eta):
     if algorithm == "reinforce":
         return "none"
@@ -81,8 +148,9 @@ def perturbation_label(algorithm, perturbation, eta):
     return f"lambda_{perturbation:g}_eta_{eta:g}"
 
 
-def output_directory(args):
-    label = perturbation_label(args.algorithm, args.perturbation, args.eta)
+def output_directory(args, algorithm=None):
+    eta = metadata_eta(args, algorithm) if algorithm is not None else args.eta
+    label = perturbation_label(args.algorithm, args.perturbation, eta)
     if args.algorithm == "mfqlearning":
         label = f"Nm_{args.simplex_resolution}"
     components = getattr(args, "n_components", None)
@@ -159,7 +227,11 @@ def build_algorithm(args, env):
     if args.algorithm == "adaptive_transport":
         if args.perturbation is None:
             raise ValueError("Adaptive transport requires --perturbation initial lambda.")
-        eta = 0.8 if args.eta is None else args.eta
+        eta = (
+            asymptotic_auxiliary_eta(args.env, effective_auxiliary_samples(args, env))
+            if args.eta is None
+            else args.eta
+        )
 
         if args.env in DISCRETE_ENVS:
             config = AdaptiveDiscreteTransportConfig(
@@ -207,7 +279,11 @@ def build_algorithm(args, env):
     if args.algorithm == "transport":
         if args.perturbation is None:
             raise ValueError("Transport requires --perturbation lambda.")
-        eta = args.perturbation if args.eta is None else args.eta
+        eta = (
+            asymptotic_auxiliary_eta(args.env, effective_auxiliary_samples(args, env))
+            if args.eta is None
+            else args.eta
+        )
 
         if args.env in DISCRETE_ENVS:
             config = DiscreteTransportConfig(
@@ -290,7 +366,7 @@ def simulator_budget_estimate(algorithm):
         return horizon * particles + horizon * gradient_samples * gradient_reuses + flow_extra
 
     if isinstance(algorithm, AdaptiveContinuousTransport):
-        gradient_samples = algorithm.n_law_gradient
+        gradient_samples = algorithm.effective_n_law_gradient
         gradient_reuses = 1 if algorithm.config.reuse_state_gradient else particles
         base_cost = horizon * particles + horizon * gradient_samples * gradient_reuses
         interval = algorithm.config.adaptive_checkpoint_interval
@@ -298,7 +374,7 @@ def simulator_budget_estimate(algorithm):
         return base_cost * (1.0 + overhead) + flow_extra
 
     if isinstance(algorithm, ContinuousTransport):
-        gradient_samples = algorithm.n_law_gradient
+        gradient_samples = algorithm.effective_n_law_gradient
         gradient_reuses = 1 if algorithm.config.reuse_state_gradient else particles
         return horizon * particles + horizon * gradient_samples * gradient_reuses + flow_extra
 
@@ -350,7 +426,7 @@ def run_training(args):
     validation_seconds = history_time_sum(history, "validation_seconds")
     unaccounted_seconds = max(0.0, elapsed_seconds - setup_seconds - train_step_seconds - validation_seconds)
 
-    out_dir = output_directory(args)
+    out_dir = output_directory(args, algorithm)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     metadata = {
@@ -367,6 +443,8 @@ def run_training(args):
         "env_config": {key: json_ready(value) for key, value in asdict(env.config).items()},
         "resolved_discount": json_ready(algorithm.discount),
         "algorithm_config": {key: json_ready(value) for key, value in asdict(algorithm.config).items()},
+        "asymptotic_bound_scales": asymptotic_bound_scales(args, algorithm),
+        "effective_n_law_gradient": getattr(algorithm, "effective_n_law_gradient", None),
         "simulator_budget_estimate": simulator_budget_estimate(algorithm),
         "elapsed_seconds": elapsed_seconds,
         "setup_seconds": setup_seconds,
