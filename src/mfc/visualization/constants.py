@@ -8,9 +8,6 @@ from mfc.environments import (
     Distribution,
     DistributionConfig,
     DistributionPolicy,
-    Kuramoto,
-    KuramotoConfig,
-    KuramotoPolicy,
     LQ,
     LQConfig,
     Portfolio,
@@ -24,7 +21,6 @@ ENVIRONMENTS = {
     "advertising": (Advertising, AdvertisingConfig),
     "cybersecurity": (Cybersecurity, CybersecurityConfig),
     "distribution": (Distribution, DistributionConfig),
-    "kuramoto": (Kuramoto, KuramotoConfig),
     "lq": (LQ, LQConfig),
     "portfolio": (Portfolio, PortfolioConfig),
     "twostate": (TwoState, TwoStateConfig),
@@ -34,7 +30,6 @@ POLICIES = {
     "advertising": AdvertisingPolicy,
     "cybersecurity": CybersecurityPolicy,
     "distribution": DistributionPolicy,
-    "kuramoto": KuramotoPolicy,
 }
 
 STATE_LABELS = {

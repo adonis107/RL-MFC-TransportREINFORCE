@@ -12,7 +12,7 @@ DETECTED="$(python3 -c 'import os; print(len(os.sched_getaffinity(0)))' 2>/dev/n
 CORES="${CORES:-${DETECTED}}"
 
 if [[ -z "${CORES_CONFIRMED:-}" && "${DETECTED}" -gt 32 ]]; then
-    echo "WARNING: the container reports ${DETECTED} CPUs, which is almost certainly the"
+    echo "WARNING: the container sees ${DETECTED} CPUs, which is almost certainly the"
     echo "  host's count rather than your allocation. Set CORES to the number of vCPU you"
     echo "  were actually given, e.g. CORES=16 $0"
     echo "  Set CORES_CONFIRMED=1 to silence this."
@@ -53,5 +53,5 @@ for env in "${ENVS[@]}"; do
 done
 
 echo "================ figures and tables ================"
-uv run python scripts/plot.py --results-root "${RESULTS_ROOT}" --env all \
-    --output-root "${RESULTS_ROOT}/figures"
+uv run python scripts/make_outputs.py --results-root "${RESULTS_ROOT}" \
+    --output-root outputs

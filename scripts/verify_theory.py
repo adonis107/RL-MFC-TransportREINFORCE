@@ -4,7 +4,7 @@ Two claims are checked, in both state spaces.
 
 V1, perturbation estimate. In finite state space the perturbed law is
 (1-lambda)*mu + lambda*psi, so d_TV(M, mu) = lambda * d_TV(psi, mu) <= lambda pathwise. We draw the
-perturbations the estimator actually uses and report the largest realized ratio d_TV(M, mu)/lambda,
+perturbations the estimator actually uses and print the largest realized ratio d_TV(M, mu)/lambda,
 which says whether lambda is the true total-variation radius or a loose parametrization. In
 continuous state space the reference gives a squared-Wasserstein perturbation estimate whose
 root scales as sqrt(lambda), up to mixture projection error. We compute the one-dimensional W1
@@ -14,7 +14,7 @@ V2, perturbation consistency. |J^lambda - J| and ||grad J^lambda - grad J|| are 
 Finite-state benchmarks carry an exact population recursion, so for a fixed draw of the perturbation
 path the objective and its gradient are exact; common random numbers across lambda make the
 difference smooth. The continuous mixture-transport objective has no closed-form oracle in these
-benchmark environments, so this script does not report a continuous V2 curve.
+benchmark environments, so this script does not print a continuous V2 curve.
 
     uv run python scripts/verify_theory.py --part all
 """

@@ -8,7 +8,7 @@ from .flows import final_policy_probabilities
 from .io import load_env_and_policy, run_label, runs_dataframe
 
 
-CONTINUOUS_TRANSPORT_ENVS = {"lq", "portfolio", "kuramoto"}
+CONTINUOUS_TRANSPORT_ENVS = {"lq", "portfolio"}
 
 
 def optimize_exact_policy(env, lambda_):
@@ -109,8 +109,7 @@ def objective_table(runs):
             row["objective_convention"] = "cost" if metadata["env"] == "lq" else "reward"
             theta = policy if not isinstance(policy, torch.nn.Module) else None
             analytic_perturbation = not (
-                metadata["algorithm"] in {"transport", "adaptive_transport"}
-                and metadata["env"] in CONTINUOUS_TRANSPORT_ENVS
+                metadata["algorithm"] == "transport" and metadata["env"] in CONTINUOUS_TRANSPORT_ENVS
             )
             if theta is not None:
                 with torch.no_grad():
@@ -151,9 +150,8 @@ def runtime_table(runs):
     if df.empty:
         return df
     df = df.copy()
-    df["eta_group"] = df["eta"].where(df["algorithm"] != "adaptive_transport")
     return (
-        df.groupby(["env", "algorithm", "perturbation", "eta_group", "horizon", "flow"], dropna=False, as_index=False)
+        df.groupby(["env", "algorithm", "perturbation", "eta", "horizon", "flow"], dropna=False, as_index=False)
         .agg(
             setup_seconds_mean=("setup_seconds", "mean"),
             setup_seconds_std=("setup_seconds", "std"),
@@ -177,7 +175,6 @@ def runtime_table(runs):
                 "elapsed_seconds_std": 0.0,
             }
         )
-        .rename(columns={"eta_group": "eta"})
     )
 
 

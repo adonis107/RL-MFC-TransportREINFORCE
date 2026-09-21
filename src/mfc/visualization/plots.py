@@ -4,7 +4,7 @@ import torch
 
 from .constants import STATE_LABELS
 from .flows import final_policy_probabilities, learned_flow
-from .io import adaptive_schedule_dataframe, load_env_and_policy, validation_dataframe
+from .io import load_env_and_policy, validation_dataframe
 
 
 STATE_FLOW_BENCHMARKS = {
@@ -15,7 +15,7 @@ STATE_FLOW_BENCHMARKS = {
 
 def state_flow_plot_horizon(metadata):
     # Cybersecurity is trained on short episodes (T=3) but its reference flow is
-    # reported over the full validation episode, T_val steps of length dt. The
+    # measured over the full validation episode, T_val steps of length dt. The
     # benchmark values are the state probabilities at the final time step.
     if metadata["env"] == "cybersecurity":
         return metadata["env_config"].get("T_val", metadata["horizon"])
@@ -157,29 +157,6 @@ def plot_state_flow(run, ax=None, save_path=None):
             ax.figure.savefig(save_path, bbox_inches="tight", dpi=180)
         return ax, pd.DataFrame({"time": list(steps), "mean": flow[:, 0].numpy(), "variance": flow[:, 1].numpy()})
 
-    if metadata["env"] == "kuramoto":
-        if ax is None:
-            _, ax = plt.subplots(figsize=(8, 4.5))
-        steps = range(flow.shape[0])
-        order = torch.linalg.norm(flow, dim=-1)
-        ax.plot(steps, flow[:, 0], label="C")
-        ax.plot(steps, flow[:, 1], label="S")
-        ax.plot(steps, order, label="R")
-        ax.set_xlabel("time")
-        ax.set_ylabel("Fourier moment")
-        ax.legend(frameon=False)
-        ax.grid(alpha=0.25)
-        if save_path is not None:
-            ax.figure.savefig(save_path, bbox_inches="tight", dpi=180)
-        return ax, pd.DataFrame(
-            {
-                "time": list(steps),
-                "cos_moment": flow[:, 0].numpy(),
-                "sin_moment": flow[:, 1].numpy(),
-                "order_parameter": order.numpy(),
-            }
-        )
-
     labels = STATE_LABELS.get(metadata["env"], [str(i) for i in range(flow.shape[1])])
     df = pd.DataFrame(flow.numpy(), columns=labels)
     df["time"] = range(len(df))
@@ -273,50 +250,3 @@ def plot_flow_comparison(runs, env, horizon=None, ax=None, save_path=None):
     if save_path is not None:
         ax.figure.savefig(save_path, bbox_inches="tight", dpi=180)
     return ax, grouped
-
-
-def plot_adaptive_schedule(runs, env=None, horizon=None, flow=None, save_path=None):
-    """Evolution of the adaptive perturbation scales and the signals driving them."""
-    df = adaptive_schedule_dataframe(runs)
-    for column, value in (("env", env), ("horizon", horizon), ("flow", flow)):
-        if value is not None:
-            df = df[df[column] == value]
-    if df.empty:
-        raise ValueError("No adaptive-transport runs matched the requested filters.")
-
-    figure, axes = plt.subplots(2, 1, figsize=(8, 6.5), sharex=True)
-    for column, name, ax in (("lambda", r"$\lambda$", axes[0]), ("eta", r"$\eta$", axes[0])):
-        summary = df.groupby("step", as_index=False)[column].agg(["mean", "std"]).reset_index()
-        summary = summary.sort_values("step").fillna({"std": 0.0})
-        line = ax.plot(summary["step"], summary["mean"], label=name)[0]
-        ax.fill_between(
-            summary["step"],
-            summary["mean"] - summary["std"],
-            summary["mean"] + summary["std"],
-            alpha=0.18,
-            color=line.get_color(),
-        )
-    axes[0].set_ylabel("perturbation scale")
-    axes[0].legend(frameon=False)
-    axes[0].grid(alpha=0.25)
-
-    for column, name in (("z_lambda", r"$z_\lambda$"), ("z_eta", r"$z_\eta$")):
-        summary = df.groupby("step", as_index=False)[column].agg(["mean"]).reset_index().sort_values("step")
-        axes[1].plot(summary["step"], summary["mean"], label=name)
-    axes[1].axhline(0.0, linestyle="--", linewidth=1.0, alpha=0.6, color="black")
-    axes[1].set_xlabel("training step")
-    axes[1].set_ylabel("controller signal")
-    axes[1].legend(frameon=False)
-    axes[1].grid(alpha=0.25)
-
-    resolved = df["lambda_resolved"].dropna()
-    if not resolved.empty:
-        rate = 100.0 * float(resolved.mean())
-        axes[1].set_title(f"bias estimate resolved on {rate:.0f}% of checkpoints", fontsize=9)
-
-    figure.tight_layout()
-    if save_path is not None:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(save_path, bbox_inches="tight", dpi=180)
-        plt.close(figure)
-    return axes

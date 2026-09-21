@@ -37,8 +37,6 @@ def parse_args():
     parser.add_argument("--simplex-resolution", type=int, default=None)
     parser.add_argument("--q-learning-lr-power", type=float, default=None)
     parser.add_argument("--q-learning-sampling", choices=["sweep", "iid"], default=None)
-    parser.add_argument("--adaptive-checkpoint-interval", type=int, default=None)
-    parser.add_argument("--adaptive-replications", type=int, default=None)
     parser.add_argument("--n-components", type=int, default=None)
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--no-baseline", action="store_true")
@@ -263,7 +261,7 @@ def print_failures(failures):
         print(f"- {record['output_dir']} ({record['log_path']}): {error}", flush=True)
 
 
-def run_pending_adaptive(pending, args):
+def run_pending_auto_workers(pending, args):
     print_lock = threading.Lock()
     queue = deque((index, record) for index, record in enumerate(pending, start=1))
     failures = []
@@ -313,7 +311,7 @@ def run_pending_adaptive(pending, args):
             with print_lock:
                 gpu_text = "n/a" if current_gpu is None else f"{current_gpu:.1f}%"
                 print(
-                    "adaptive "
+                    "auto-workers "
                     f"active={len(futures)} limit={active_limit}/{args.workers} "
                     f"queued={len(queue)} cpu={current_cpu:.1f}% gpu={gpu_text} "
                     f"mem_avail={current_memory:.1f}GB",
@@ -371,7 +369,7 @@ def main():
         return
 
     if args.auto_workers:
-        run_pending_adaptive(pending, args)
+        run_pending_auto_workers(pending, args)
     else:
         run_pending(pending, args.workers)
 

@@ -74,9 +74,6 @@ def run_label(metadata):
         return "MFQ-learning" if resolution is None else f"MFQ-learning Nm={resolution}"
     if algorithm == "mfreinforce":
         return f"MF-REINFORCE eps={metadata['perturbation']:g}"
-    if algorithm == "adaptive_transport":
-        initial_eta = metadata.get("algorithm_config", {}).get("eta", metadata.get("eta"))
-        return f"Adaptive transport lambda0={metadata['perturbation']:g}, eta0={initial_eta:g}"
     label = f"Transport lambda={metadata['perturbation']:g}"
     eta = metadata.get("eta")
     if eta is not None:
@@ -97,7 +94,7 @@ def best_runs_by_label(runs, prefer_validation=True):
             value = summary.get("last_objective")
         if value is None:
             continue
-        eta_key = None if metadata["algorithm"] == "adaptive_transport" else metadata.get("eta")
+        eta_key = metadata.get("eta")
         if metadata["algorithm"] == "mfqlearning":
             eta_key = metadata.get("algorithm_config", {}).get("simplex_resolution")
         key = (
@@ -178,54 +175,6 @@ def validation_dataframe(runs):
                     "step": step,
                     "simulator_transitions": step * (metadata.get("simulator_budget_estimate") or 1),
                     "validation_reward": value,
-                }
-            )
-
-    return pd.DataFrame(rows)
-
-
-def adaptive_schedule_dataframe(runs):
-    """Per-checkpoint controller state for adaptive-transport runs.
-
-    The perturbation scales are also recorded at every training step under the
-    "lambda"/"eta" keys; the checkpoint view is the one that carries the
-    controller diagnostics that produced each change.
-    """
-    rows = []
-    for run in runs:
-        metadata = run["metadata"]
-        if metadata["algorithm"] != "adaptive_transport":
-            continue
-        history = run["history"]
-        steps = history.get("adaptive_step", [])
-        resolved_lambda = history.get("adaptive_lambda_resolved")
-        resolved_eta = history.get("adaptive_eta_resolved")
-        for index, step in enumerate(steps):
-            def at(key, default=None):
-                series = history.get(key)
-                if series is None or index >= len(series):
-                    return default
-                return series[index]
-
-            rows.append(
-                {
-                    "env": metadata["env"],
-                    "label": run_label(metadata),
-                    "horizon": metadata["horizon"],
-                    "flow": metadata["flow"],
-                    "seed": metadata["seed"],
-                    "step": step,
-                    "lambda": at("adaptive_lambda_after"),
-                    "eta": at("adaptive_eta_after"),
-                    "lambda_before": at("adaptive_lambda_before"),
-                    "eta_before": at("adaptive_eta_before"),
-                    "z_lambda": at("adaptive_z_lambda"),
-                    "z_eta": at("adaptive_z_eta"),
-                    "bias_lambda": at("adaptive_bias_lambda"),
-                    "bias_eta": at("adaptive_bias_eta"),
-                    "variance": at("adaptive_variance"),
-                    "lambda_resolved": None if resolved_lambda is None else at("adaptive_lambda_resolved"),
-                    "eta_resolved": None if resolved_eta is None else at("adaptive_eta_resolved"),
                 }
             )
 

@@ -10,10 +10,6 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 
 from mfc.algorithms import (
-    AdaptiveContinuousTransport,
-    AdaptiveContinuousTransportConfig,
-    AdaptiveDiscreteTransport,
-    AdaptiveDiscreteTransportConfig,
     ContinuousTransport,
     ContinuousTransportConfig,
     DiscreteTransport,
@@ -32,8 +28,6 @@ from mfc.environments import (
     CybersecurityConfig,
     Distribution,
     DistributionConfig,
-    Kuramoto,
-    KuramotoConfig,
     LQ,
     LQConfig,
     Portfolio,
@@ -49,13 +43,12 @@ ENVIRONMENTS = {
     "distribution": (Distribution, DistributionConfig),
     "advertising": (Advertising, AdvertisingConfig),
     "lq": (LQ, LQConfig),
-    "kuramoto": (Kuramoto, KuramotoConfig),
     "portfolio": (Portfolio, PortfolioConfig),
 }
 
 DISCRETE_ENVS = {"twostate", "cybersecurity", "distribution", "advertising"}
-CONTINUOUS_ENVS = {"lq", "portfolio", "kuramoto"}
-TRANSPORT_ALGORITHMS = {"transport", "adaptive_transport"}
+CONTINUOUS_ENVS = {"lq", "portfolio"}
+TRANSPORT_ALGORITHMS = {"transport"}
 
 
 def maybe_float(value):
@@ -123,11 +116,7 @@ def effective_auxiliary_samples(args, env):
 def asymptotic_bound_scales(args, algorithm):
     if args.algorithm not in TRANSPORT_ALGORITHMS:
         return None
-    auxiliary = (
-        algorithm.n_logit_gradient
-        if isinstance(algorithm, (DiscreteTransport, AdaptiveDiscreteTransport))
-        else algorithm.effective_n_law_gradient
-    )
+    auxiliary = algorithm.n_logit_gradient if isinstance(algorithm, DiscreteTransport) else algorithm.effective_n_law_gradient
     return {
         "lambda": asymptotic_main_lambda(algorithm.n_particles),
         "eta": asymptotic_auxiliary_eta(args.env, auxiliary),
@@ -154,7 +143,7 @@ def output_directory(args, algorithm=None):
     if args.algorithm == "mfqlearning":
         label = f"Nm_{args.simplex_resolution}"
     components = getattr(args, "n_components", None)
-    if components is not None and args.env in CONTINUOUS_ENVS and args.algorithm in TRANSPORT_ALGORITHMS:
+    if components is not None and args.env in CONTINUOUS_ENVS and args.algorithm == "transport":
         label = f"{label}_K_{components}"
     name = f"{args.algorithm}_{label}_T_{args.horizon}_{args.flow}_seed_{args.seed}"
     return Path(args.results_root) / args.env / name
@@ -223,58 +212,6 @@ def build_algorithm(args, env):
             reuse_state_gradient=not args.no_reuse_state_gradient,
         )
         return MFReinforce(env, config=config)
-
-    if args.algorithm == "adaptive_transport":
-        if args.perturbation is None:
-            raise ValueError("Adaptive transport requires --perturbation initial lambda.")
-        eta = (
-            asymptotic_auxiliary_eta(args.env, effective_auxiliary_samples(args, env))
-            if args.eta is None
-            else args.eta
-        )
-
-        if args.env in DISCRETE_ENVS:
-            config = AdaptiveDiscreteTransportConfig(
-                **common,
-                lambda_=args.perturbation,
-                eta=eta,
-                flow=args.flow,
-                n_flow_particles=args.n_flow_particles,
-                n_logit_gradient=args.n_logit_gradient,
-                simplex_sigma=args.simplex_sigma,
-                baseline=use_baseline,
-                reuse_state_gradient=not args.no_reuse_state_gradient,
-                adaptive_checkpoint_interval=args.adaptive_checkpoint_interval
-                if args.adaptive_checkpoint_interval is not None
-                else AdaptiveDiscreteTransportConfig.adaptive_checkpoint_interval,
-                adaptive_replications=args.adaptive_replications
-                if args.adaptive_replications is not None
-                else AdaptiveDiscreteTransportConfig.adaptive_replications,
-            )
-            return AdaptiveDiscreteTransport(env, config=config)
-
-        if args.env in CONTINUOUS_ENVS:
-            config = AdaptiveContinuousTransportConfig(
-                **common,
-                lambda_=args.perturbation,
-                eta=eta,
-                flow=args.flow,
-                n_flow_particles=args.n_flow_particles,
-                n_law_gradient=args.n_law_gradient,
-                n_law_particles=args.n_law_particles,
-                n_components=args.n_components
-                if args.n_components is not None
-                else ContinuousTransportConfig.n_components,
-                baseline=use_baseline,
-                reuse_state_gradient=not args.no_reuse_state_gradient,
-                adaptive_checkpoint_interval=args.adaptive_checkpoint_interval
-                if args.adaptive_checkpoint_interval is not None
-                else AdaptiveContinuousTransportConfig.adaptive_checkpoint_interval,
-                adaptive_replications=args.adaptive_replications
-                if args.adaptive_replications is not None
-                else AdaptiveContinuousTransportConfig.adaptive_replications,
-            )
-            return AdaptiveContinuousTransport(env, config=config)
 
     if args.algorithm == "transport":
         if args.perturbation is None:
@@ -352,26 +289,10 @@ def simulator_budget_estimate(algorithm):
     if isinstance(algorithm, MeanFieldQLearning):
         return 1
 
-    if isinstance(algorithm, AdaptiveDiscreteTransport):
-        gradient_samples = algorithm.n_logit_gradient
-        gradient_reuses = 1 if algorithm.config.reuse_state_gradient else particles
-        base_cost = horizon * particles + horizon * gradient_samples * gradient_reuses
-        interval = algorithm.config.adaptive_checkpoint_interval
-        overhead = 0.0 if not interval else 2.0 * algorithm.config.adaptive_replications / interval
-        return base_cost * (1.0 + overhead) + flow_extra
-
     if isinstance(algorithm, DiscreteTransport):
         gradient_samples = algorithm.n_logit_gradient
         gradient_reuses = 1 if algorithm.config.reuse_state_gradient else particles
         return horizon * particles + horizon * gradient_samples * gradient_reuses + flow_extra
-
-    if isinstance(algorithm, AdaptiveContinuousTransport):
-        gradient_samples = algorithm.effective_n_law_gradient
-        gradient_reuses = 1 if algorithm.config.reuse_state_gradient else particles
-        base_cost = horizon * particles + horizon * gradient_samples * gradient_reuses
-        interval = algorithm.config.adaptive_checkpoint_interval
-        overhead = 0.0 if not interval else 2.0 * algorithm.config.adaptive_replications / interval
-        return base_cost * (1.0 + overhead) + flow_extra
 
     if isinstance(algorithm, ContinuousTransport):
         gradient_samples = algorithm.effective_n_law_gradient
@@ -394,8 +315,6 @@ def metadata_eta(args, algorithm):
     if args.algorithm == "mfreinforce":
         return algorithm.perturbation_eta
     if args.algorithm == "transport":
-        return algorithm.eta
-    if args.algorithm == "adaptive_transport":
         return algorithm.eta
     return args.eta
 
@@ -497,12 +416,7 @@ def default_flow(args):
 def parse_args():
     parser = argparse.ArgumentParser(description="Train one MFC experiment.")
     parser.add_argument("--env", choices=ENVIRONMENTS, required=True)
-    parser.add_argument(
-        "--algorithm",
-        "--alg",
-        choices=["reinforce", "mfreinforce", "transport", "adaptive_transport", "mfqlearning"],
-        required=True,
-    )
+    parser.add_argument("--algorithm", "--alg", choices=["reinforce", "mfreinforce", "transport", "mfqlearning"], required=True)
     parser.add_argument("--perturbation", type=maybe_float, default=None)
     parser.add_argument("--eta", type=maybe_float, default=None)
     parser.add_argument("--horizon", "--T", type=int, required=True)
@@ -523,8 +437,6 @@ def parse_args():
     parser.add_argument("--q-learning-lr-power", type=float, default=0.6)
     parser.add_argument("--q-learning-sampling", choices=["sweep", "iid"], default="sweep")
     parser.add_argument("--n-components", type=int, default=None)
-    parser.add_argument("--adaptive-checkpoint-interval", type=int, default=None)
-    parser.add_argument("--adaptive-replications", type=int, default=None)
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--no-baseline", action="store_true")
     parser.add_argument("--no-reuse-state-gradient", action="store_true")

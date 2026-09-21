@@ -41,7 +41,6 @@ HORIZONS = {
     "advertising": 5,
     "lq": 20,
     "portfolio": 10,
-    "kuramoto": 20,
 }
 KIND = {
     "twostate": "discrete",
@@ -50,9 +49,8 @@ KIND = {
     "advertising": "discrete",
     "lq": "lq",
     "portfolio": "portfolio",
-    "kuramoto": "kuramoto",
 }
-PATHWISE_PARTICLES = {"lq": 8192, "portfolio": 8192, "kuramoto": 4096}
+PATHWISE_PARTICLES = {"lq": 8192, "portfolio": 8192}
 
 
 def policy_parameters(algorithm):
@@ -116,27 +114,16 @@ def continuous_gradient(env, algorithm, horizon, detach, kind, n_particles, seed
     objective = torch.zeros((), dtype=env.dtype, device=env.device)
 
     for t in range(horizon):
-        if kind == "kuramoto":
-            law = torch.stack([torch.cos(states).mean(), torch.sin(states).mean()])
-        else:
-            law = states.mean()
+        law = states.mean()
         argument = law.detach() if detach else law
 
         policy_noise = torch.randn(states.shape, dtype=env.dtype, device=env.device, generator=generator)
-        if kind == "kuramoto":
-            time = torch.tensor(float(t), dtype=env.dtype, device=env.device)
-            actions = algorithm.policy(time, states, argument) + env.config.tau * policy_noise
-        else:
-            actions = env.policy_mean(algorithm.policy, t, states, argument) + env.config.tau * policy_noise
+        actions = env.policy_mean(algorithm.policy, t, states, argument) + env.config.tau * policy_noise
 
         objective = objective + env.reward(states, argument, actions).mean()
 
         state_noise = torch.randn(states.shape, dtype=env.dtype, device=env.device, generator=generator)
-        if kind == "kuramoto":
-            drift = env.config.coupling * env.interaction_field(states, argument) + actions
-            diffusion = (2.0 * env.config.diffusion * env.config.dt) ** 0.5
-            states = states + env.config.dt * drift + diffusion * state_noise
-        elif kind == "lq":
+        if kind == "lq":
             states = (
                 env.config.a * states
                 + env.config.b * actions
@@ -147,10 +134,7 @@ def continuous_gradient(env, algorithm, horizon, detach, kind, n_particles, seed
             excess_return = env.rbar[t] + env.sigma_R[t] * state_noise
             states = env.s[t] * states + actions * excess_return
 
-    if kind == "kuramoto":
-        law = torch.stack([torch.cos(states).mean(), torch.sin(states).mean()])
-    else:
-        law = states.mean()
+    law = states.mean()
     argument = law.detach() if detach else law
     objective = objective + env.terminal_reward(states, argument).mean()
 
@@ -247,8 +231,6 @@ def main():
     ablation = [
         ("portfolio", "gamma=0", dict(mean_field_penalty=0.0)),
         ("portfolio", "gamma=2", dict(mean_field_penalty=2.0)),
-        ("kuramoto", "order_weight=0", dict(order_weight=0.0, terminal_order_weight=0.0)),
-        ("kuramoto", "order_weight=10", dict(order_weight=10.0, terminal_order_weight=50.0)),
     ]
     rows = []
     for name, label, overrides in ablation:

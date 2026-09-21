@@ -83,17 +83,6 @@ def flow_dataframe(run):
                 "variance": flow[:, 1].numpy(),
             }
         )
-    if metadata["env"] == "kuramoto":
-        order = torch.linalg.norm(flow, dim=-1)
-        return pd.DataFrame(
-            {
-                "time": range(flow.shape[0]),
-                "cos_moment": flow[:, 0].numpy(),
-                "sin_moment": flow[:, 1].numpy(),
-                "order_parameter": order.numpy(),
-            }
-        )
-
     labels = STATE_LABELS.get(metadata["env"], [str(i) for i in range(flow.shape[1])])
     df = pd.DataFrame(flow.numpy(), columns=labels)
     df["time"] = range(len(df))

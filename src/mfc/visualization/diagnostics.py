@@ -13,7 +13,7 @@ from mfc.algorithms import (
 from .io import load_env_and_policy, run_label
 
 
-CONTINUOUS_ENVS = {"lq", "portfolio", "kuramoto"}
+CONTINUOUS_ENVS = {"lq", "portfolio"}
 IDENTIFICATION_COMPONENTS = (1, 2, 3)
 IDENTIFICATION_FLOORS = (1e-4, 1e-2, 1e-1)
 
@@ -358,8 +358,6 @@ def identification_sweep(
                 "estimate_se": float(estimate_std / n_replications**0.5),
             }
 
-            # Kuramoto has no gradient oracle and a module policy, so there the
-            # sweep reports conditioning and dispersion only.
             if hasattr(env, "exact_gradient") and not isinstance(policy, torch.nn.Module):
                 exact = reward_gradient(env, policy, lambda_=0.0).detach().reshape(-1).cpu()
                 bias_norm = (mean_estimate - exact).norm()

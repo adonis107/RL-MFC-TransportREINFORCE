@@ -14,8 +14,8 @@ estimator is tuned on the same footing as the baselines it is compared against.
     uv run python scripts/tune_perturbation.py --env all
 
 The reference policy matters. Scoring at a near-stationary policy divides by a vanishing
-gradient and reports noise, so the reference is chosen as the warm start with the largest
-oracle gradient, and that norm is reported alongside every row.
+gradient and estimates noise, so the reference is chosen as the warm start with the largest
+oracle gradient, and that norm is printed alongside every row.
 """
 
 import argparse
@@ -51,7 +51,7 @@ WARM_STARTS = (0, 100, 200, 500)
 
 
 def budget_split(env_name, horizon, lambda_):
-    """Main and auxiliary block sizes of the reported run, so the screen keeps its budget."""
+    """Main and auxiliary block sizes of the run, so the screen keeps its budget."""
     job_spec = {
         "env": env_name,
         "algorithm": "transport",
@@ -149,7 +149,7 @@ def summarize(table):
     )
 
 
-def report(summary):
+def print_summary(summary):
     selected = {}
     for env_name, group in summary.groupby("benchmark", sort=False):
         best = group.loc[group["rmse"].idxmin()]
@@ -208,7 +208,7 @@ def main():
     table = pd.concat(tables, ignore_index=True)
     save_table(table, output)
     print(f"wrote {output}")
-    report(summarize(table))
+    print_summary(summarize(table))
 
 
 if __name__ == "__main__":

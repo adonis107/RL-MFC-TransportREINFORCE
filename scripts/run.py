@@ -34,7 +34,7 @@ CONTINUOUS_REFERENCE = {
 }
 
 CONTINUOUS_COMPONENTS = {
-    "lq": (1, 2, 3),
+    "lq": (1, 2),
     "portfolio": (1,),
 }
 
