@@ -1,6 +1,6 @@
 """Create the final figures and tables from saved runs.
 
-    uv run python scripts/make_outputs.py --results-root results/bound_scales_cpu
+    uv run python scripts/make_outputs.py --results-root results
 
 Outputs are written under ``outputs/`` by default:
 
