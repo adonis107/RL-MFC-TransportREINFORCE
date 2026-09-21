@@ -13,12 +13,25 @@ import run as run_plan
 import train as train_script
 
 
+def parse_env_list(value):
+    """One benchmark, a comma-separated list of them, or 'all'."""
+    names = [part.strip() for part in value.split(",") if part.strip()]
+    allowed = list(run_plan.PRIMARY_ENVS) + ["all"]
+    unknown = [name for name in names if name not in allowed]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"invalid choice(s): {', '.join(unknown)} (choose from {', '.join(allowed)})"
+        )
+    return list(run_plan.PRIMARY_ENVS) if "all" in names else names
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run the MFC training grid with parallel workers.")
     parser.add_argument(
         "--env",
-        choices=run_plan.PRIMARY_ENVS + ["all"],
+        type=parse_env_list,
         required=True,
+        help="one benchmark, a comma-separated list of them, or 'all'",
     )
     parser.add_argument("--seeds", type=run_plan.parse_seed_list, default=[0, 1, 2, 3, 4])
     parser.add_argument("--results-root", default="results")
@@ -97,7 +110,7 @@ def log_path_for(output_dir, results_root, logs_root):
 
 
 def build_records(args):
-    selected_envs = run_plan.PRIMARY_ENVS if args.env == "all" else [args.env]
+    selected_envs = args.env
     results_root = Path(args.results_root)
     logs_root = args.logs_root or results_root / "logs"
     records = []
