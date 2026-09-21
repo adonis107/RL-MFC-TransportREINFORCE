@@ -5,7 +5,8 @@ cd "$(dirname "$0")/.."
 
 WORKERS="${WORKERS:-7}"
 RESULTS_ROOT="${RESULTS_ROOT:-results}"
-ENVS=(portfolio lq advertising cybersecurity twostate distribution)
+# Overridable so a partial suite can be launched: ENVS="lq portfolio" ./scripts/run_suite.sh
+read -r -a ENVS <<< "${ENVS:-portfolio lq advertising cybersecurity twostate distribution}"
 
 DETECTED="$(python3 -c 'import os; print(len(os.sched_getaffinity(0)))' 2>/dev/null \
             || nproc --all 2>/dev/null || echo 1)"

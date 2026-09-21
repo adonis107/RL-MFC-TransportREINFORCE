@@ -114,9 +114,39 @@ def effective_auxiliary_samples(env):
     return auxiliary
 
 
+# Auxiliary radius, measured rather than derived. Balancing the error bound gives
+# eta ~ n^(-1/4) in finite state space and n^(-1/6) in continuous state space, but that is the
+# minimizer of the bound with its constants dropped. The true minimizer is (b/(a n))^(1/4), and
+# here the variance constant b exceeds the bias constant a by orders of magnitude: the auxiliary
+# score is heavy-tailed and enters multiplied by (1 - eta)/eta, which is 3.09 at eta = 0.2445
+# against 0.02 at eta = 0.98. When b/(a n) > 1 the unconstrained minimizer leaves the admissible
+# range and the optimum sits at its top. Measured against the distribution-planning gradient
+# oracle, the asymptotic eta = 0.2445 costs a factor of 8100 in gradient root-mean-square error
+# against eta = 0.98 (6538.6 against 0.804), which is why it must not be derived from the bound.
+# Benchmarks absent here fall back to the asymptotic rule.
+# The continuous estimator is far less sensitive than the finite-state one, because its score is
+# Gaussian and enters as 1/eta rather than (1 - eta)/eta on a heavy-tailed score: on the
+# linear-quadratic benchmark the asymptotic eta = 0.4292 costs a factor of 2.2 in gradient
+# root-mean-square error against eta = 0.95, not 8100. The measured optimum is monotone in eta over
+# the tested range, with the bias flat, so the radius sits at the top of the admissible range in
+# both state spaces.
+MEASURED_AUXILIARY_ETA = {
+    "distribution": 0.98,
+    "lq": 0.95,
+    "portfolio": 0.95,
+}
+
+
 def asymptotic_auxiliary_eta(env):
     exponent = 1.0 / 6.0 if env in CONTINUOUS_ENVS else 1.0 / 4.0
     return round_scale(effective_auxiliary_samples(env) ** (-exponent))
+
+
+def auxiliary_eta(env):
+    """Measured radius where one exists, otherwise the value the bound suggests."""
+    if env in MEASURED_AUXILIARY_ETA:
+        return MEASURED_AUXILIARY_ETA[env]
+    return asymptotic_auxiliary_eta(env)
 
 
 def asymptotic_main_lambda(env, multiplier=1.0):
@@ -140,7 +170,7 @@ def transport_job(env, flow="exact", lambda_=None, n_components=None):
         allocation["horizon"],
         flow=flow,
         perturbation=asymptotic_main_lambda(env) if lambda_ is None else lambda_,
-        eta=asymptotic_auxiliary_eta(env),
+        eta=auxiliary_eta(env),
         n_components=n_components,
         simplex_sigma=allocation.get("simplex_sigma"),
     )

@@ -89,6 +89,31 @@ def save_figure(figure, path):
     print(f"wrote {path}")
 
 
+def env_dir(results_root, env):
+    root = Path(results_root)
+    direct = root / env
+    if direct.exists():
+        return direct
+    partial = root / f"{env}_partial" / env
+    if partial.exists():
+        return partial
+    partial = root / f"{env}_partial"
+    if partial.exists():
+        return partial
+    return direct
+
+
+def has_run(results_root, env):
+    return any(env_dir(results_root, env).glob("*/history.json"))
+
+
+def load_env_runs(results_root, env):
+    directory = env_dir(results_root, env)
+    if directory.name == env:
+        return load_runs(directory.parent, env=directory.name)
+    return load_runs(directory)
+
+
 def transport_stem(env, flow=None, components=None):
     flow = MAIN_FLOW[env] if flow is None else flow
     lambda_ = run_plan.asymptotic_main_lambda(env)
@@ -147,11 +172,18 @@ def style(ax):
 
 
 def learning_curves(results_root, output):
-    figure, axes = plt.subplots(2, 2, figsize=(5.5, 3.9), constrained_layout=True)
-    for ax, (title, (env, optimum)) in zip(axes.flat, LEARNING_PANELS.items()):
+    panels = [(title, spec) for title, spec in LEARNING_PANELS.items() if has_run(results_root, spec[0])]
+    if not panels:
+        print("skipping learning_curves: no matching runs found")
+        return
+    ncols = min(2, len(panels))
+    nrows = int(np.ceil(len(panels) / ncols))
+    figure, axes = plt.subplots(nrows, ncols, figsize=(5.5, 1.95 * nrows), constrained_layout=True)
+    axes = np.atleast_1d(axes).ravel()
+    for ax, (title, (env, optimum)) in zip(axes, panels):
         panel = []
         for method, stem in run_stems(env).items():
-            seeds = curves(Path(results_root) / env, stem)
+            seeds = curves(env_dir(results_root, env), stem)
             if seeds is None:
                 continue
             steps = np.arange(1, seeds.shape[1] + 1) * 10
@@ -184,8 +216,11 @@ def learning_curves(results_root, output):
         ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
         ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(compact_tick))
 
+    for ax in axes[len(panels):]:
+        ax.remove()
+
     found = {}
-    for ax in axes.flat:
+    for ax in axes[:len(panels)]:
         for handle, label in zip(*ax.get_legend_handles_labels()):
             found.setdefault(label, handle)
     order = [name for name in ("REINFORCE", "MF-REINFORCE", "Transport") if name in found]
@@ -200,81 +235,107 @@ def tensor_policy(path):
 
 
 def learned_policies(results_root, output):
-    figure, axes = plt.subplots(1, 3, figsize=(5.5, 2.05), constrained_layout=True)
+    panels = [env for env in ("portfolio", "twostate", "distribution") if has_run(results_root, env)]
+    if not panels:
+        print("skipping learned_policies: no matching runs found")
+        return
 
-    env = Portfolio(PortfolioConfig(T=10))
-    with torch.no_grad():
-        optimal, _ = env.moment_flow(env.optimal_policy(), lambda_=0.0)
-    steps = np.arange(optimal.numel())
-    axes[0].plot(steps, optimal.cpu().numpy(), color=OPTIMAL, linewidth=1.0, dashes=(3, 2), label=r"$\theta^\star$")
-    for method, path in {
-        "Transport": Path(results_root) / "portfolio" / f"{transport_stem('portfolio', components=1)}_seed_0",
-        "REINFORCE": Path(results_root) / "portfolio" / "reinforce_none_T_10_exact_seed_0",
-    }.items():
+    figure, axes = plt.subplots(1, len(panels), figsize=(max(2.1 * len(panels), 3.0), 2.05), constrained_layout=True)
+    axes = np.atleast_1d(axes).ravel()
+    axis_by_panel = dict(zip(panels, axes))
+
+    if "portfolio" in axis_by_panel:
+        ax = axis_by_panel["portfolio"]
+        env = Portfolio(PortfolioConfig(T=10, device="cpu"))
         with torch.no_grad():
-            flow, _ = env.moment_flow(tensor_policy(path), lambda_=0.0)
-        axes[0].plot(steps, flow.cpu().numpy(), color=METHOD_COLOR[method], linewidth=1.2, label=method)
-    axes[0].set_title("Portfolio: mean wealth flow", fontsize=8, color=INK, pad=3)
-    axes[0].set_xlabel("$t$", fontsize=7.5)
-    axes[0].set_ylabel(r"$\bar x(\mu_t^\theta)$", fontsize=7.5)
-    style(axes[0])
+            optimal, _ = env.moment_flow(env.optimal_policy(), lambda_=0.0)
+        steps = np.arange(optimal.numel())
+        ax.plot(steps, optimal.cpu().numpy(), color=OPTIMAL, linewidth=1.0, dashes=(3, 2), label=r"$\theta^\star$")
+        portfolio_dir = env_dir(results_root, "portfolio")
+        for method, path in {
+            "Transport": portfolio_dir / f"{transport_stem('portfolio', components=1)}_seed_0",
+            "REINFORCE": portfolio_dir / "reinforce_none_T_10_exact_seed_0",
+        }.items():
+            if not (path / "policy.pt").exists():
+                continue
+            with torch.no_grad():
+                flow, _ = env.moment_flow(tensor_policy(path), lambda_=0.0)
+            ax.plot(steps, flow.cpu().numpy(), color=METHOD_COLOR[method], linewidth=1.2, label=method)
+        ax.set_title("Portfolio: mean wealth flow", fontsize=8, color=INK, pad=3)
+        ax.set_xlabel("$t$", fontsize=7.5)
+        ax.set_ylabel(r"$\bar x(\mu_t^\theta)$", fontsize=7.5)
+        style(ax)
 
-    env = TwoState(TwoStateConfig(T=5))
-    runs = {
-        "Transport": Path(results_root) / "twostate" / f"{transport_stem('twostate')}_seed_0",
-        "MF-REINFORCE": Path(results_root) / "twostate" / "mfreinforce_eps_0.2_T_5_exact_seed_0",
-        "REINFORCE": Path(results_root) / "twostate" / "reinforce_none_T_5_exact_seed_0",
-    }
-    steps = np.arange(env.config.T + 1)
-    for name, theta in [(r"$\theta^\star$", env.optimal_theta())] + [(m, tensor_policy(q)) for m, q in runs.items()]:
-        law = env.initial_distribution.clone()
-        trace = [float(law[1])]
-        with torch.no_grad():
-            for t in range(env.config.T):
-                law = mean_field_next_law(env, theta, lambda step: step, t, law)
-                trace.append(float(law[1]))
-        colour = OPTIMAL if name.startswith("$") else METHOD_COLOR[name]
-        dashes = (3, 2) if name.startswith("$") else (None, None)
-        axes[1].plot(steps, trace, color=colour, linewidth=1.1, dashes=dashes, label=name)
-    axes[1].set_title("Two-state: population flow", fontsize=8, color=INK, pad=3)
-    axes[1].set_xlabel("$t$", fontsize=7.5)
-    axes[1].set_ylabel(r"$\mu_t^\theta(1)$", fontsize=7.5)
-    style(axes[1])
+    if "twostate" in axis_by_panel:
+        ax = axis_by_panel["twostate"]
+        env = TwoState(TwoStateConfig(T=5, device="cpu"))
+        run_dir = env_dir(results_root, "twostate")
+        runs = {
+            "Transport": run_dir / f"{transport_stem('twostate')}_seed_0",
+            "MF-REINFORCE": run_dir / "mfreinforce_eps_0.2_T_5_exact_seed_0",
+            "REINFORCE": run_dir / "reinforce_none_T_5_exact_seed_0",
+        }
+        steps = np.arange(env.config.T + 1)
+        policies = [(m, tensor_policy(q)) for m, q in runs.items() if (q / "policy.pt").exists()]
+        for name, theta in [(r"$\theta^\star$", env.optimal_theta())] + policies:
+            law = env.initial_distribution.clone()
+            trace = [float(law[1])]
+            with torch.no_grad():
+                for t in range(env.config.T):
+                    law = mean_field_next_law(env, theta, lambda step: step, t, law)
+                    trace.append(float(law[1]))
+            colour = OPTIMAL if name.startswith("$") else METHOD_COLOR[name]
+            dashes = (3, 2) if name.startswith("$") else (None, None)
+            ax.plot(steps, trace, color=colour, linewidth=1.1, dashes=dashes, label=name)
+        ax.set_title("Two-state: population flow", fontsize=8, color=INK, pad=3)
+        ax.set_xlabel("$t$", fontsize=7.5)
+        ax.set_ylabel(r"$\mu_t^\theta(1)$", fontsize=7.5)
+        style(ax)
 
-    env = Distribution(DistributionConfig())
-    states = np.arange(env.n_states)
+    if "distribution" in axis_by_panel:
+        ax = axis_by_panel["distribution"]
+        env = Distribution(DistributionConfig(device="cpu"))
+        states = np.arange(env.n_states)
 
-    def terminal(policy):
-        law = env.initial_distribution.clone()
-        with torch.no_grad():
-            for t in range(env.config.T):
-                law = env.population_step(law, policy(t, law))
-        return law.cpu().numpy()
+        def terminal(policy):
+            law = env.initial_distribution.clone()
+            with torch.no_grad():
+                for t in range(env.config.T):
+                    law = env.population_step(law, policy(t, law))
+            return law.cpu().numpy()
 
-    axes[2].plot(states, terminal(env.optimal_policy()), color=OPTIMAL, linewidth=1.0,
-                 dashes=(3, 2), label=r"$\theta^\star$")
-    for method, (folder, stem) in {
-        "Transport": (Path(results_root) / "distribution", transport_stem("distribution")),
-        "MF-REINFORCE": (Path(results_root) / "distribution", "mfreinforce_eps_2_T_5_exact"),
-        "REINFORCE": (Path(results_root) / "distribution", "reinforce_none_T_5_exact"),
-    }.items():
-        module = DistributionPolicy(env.config)
-        blob = torch.load(folder / f"{stem}_seed_0" / "policy.pt", map_location="cpu", weights_only=False)
-        module.load_state_dict(blob["state_dict"])
-        axes[2].plot(states, terminal(lambda t, mu: module(torch.tensor(float(t)), mu)),
-                     color=METHOD_COLOR[method], linewidth=1.1, marker=METHOD_MARKER[method],
-                     markersize=3.0, label=method)
-    axes[2].set_title("Distribution: terminal law", fontsize=8, color=INK, pad=3)
-    axes[2].set_xlabel("state", fontsize=7.5)
-    axes[2].set_ylabel(r"$\mu_T^\theta(x)$", fontsize=7.5)
-    style(axes[2])
+        ax.plot(states, terminal(env.optimal_policy()), color=OPTIMAL, linewidth=1.0,
+                dashes=(3, 2), label=r"$\theta^\star$")
+        run_dir = env_dir(results_root, "distribution")
+        for method, stem in {
+            "Transport": transport_stem("distribution"),
+            "MF-REINFORCE": "mfreinforce_eps_2_T_5_exact",
+            "REINFORCE": "reinforce_none_T_5_exact",
+        }.items():
+            folder = run_dir / f"{stem}_seed_0"
+            if not (folder / "policy.pt").exists():
+                continue
+            module = DistributionPolicy(env.config)
+            blob = torch.load(folder / "policy.pt", map_location="cpu", weights_only=False)
+            module.load_state_dict(blob["state_dict"])
+            ax.plot(states, terminal(lambda t, mu: module(torch.tensor(float(t)), mu)),
+                    color=METHOD_COLOR[method], linewidth=1.1, marker=METHOD_MARKER[method],
+                    markersize=3.0, label=method)
+        ax.set_title("Distribution: terminal law", fontsize=8, color=INK, pad=3)
+        ax.set_xlabel("state", fontsize=7.5)
+        ax.set_ylabel(r"$\mu_T^\theta(x)$", fontsize=7.5)
+        style(ax)
 
-    handles, labels = axes[1].get_legend_handles_labels()
+    handles, labels = axes[0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="outside lower center", ncol=4, frameon=False, handlelength=1.8)
     save_figure(figure, output)
 
 
 def theory_verification(estimate_csv, consistency_csv, output):
+    if not Path(estimate_csv).exists() or not Path(consistency_csv).exists():
+        print("skipping theory_verification: diagnostic CSVs not found")
+        return
+
     display = {"twostate": "Two-state", "cybersecurity": "Cybersecurity", "distribution": "Distribution",
                "advertising": "Advertising", "lq": "Linear-quadratic", "portfolio": "Portfolio"}
     order = ["lq", "portfolio", "twostate", "distribution", "cybersecurity", "advertising"]
@@ -363,7 +424,7 @@ def table_environment(body, caption, label, alignment, size=None):
 
 
 def grouped_objectives(results_root, env):
-    table = objective_table(load_runs(results_root, env=env))
+    table = objective_table(load_env_runs(results_root, env))
     grouped = (
         table.groupby(["label", "flow", "horizon"])["validation_reward"]
         .agg(["mean", "std", "count"])
@@ -388,7 +449,7 @@ def reference_optimum(results_root, env):
     horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
     if (env, horizon) in REFERENCE_OPTIMUM:
         return REFERENCE_OPTIMUM[(env, horizon)]
-    table = objective_table(load_runs(results_root, env=env))
+    table = objective_table(load_env_runs(results_root, env))
     if "J0_star" not in table.columns:
         return None
     values = table.loc[table["horizon"] == horizon, "J0_star"].dropna()
@@ -403,7 +464,7 @@ def objective_summary(results_root):
         "Benchmark & Optimum & REINFORCE & MF-REINFORCE & Transport & $(\\lambda,\\eta)$ \\\\",
         "\\midrule",
     ]
-    for env in BENCHMARKS:
+    for env in [name for name in BENCHMARKS if has_run(results_root, name)]:
         grouped, _ = grouped_objectives(results_root, env)
         best = select_headline(grouped, env)
         optimum = reference_optimum(results_root, env)
@@ -436,8 +497,9 @@ def budget_runtime(results_root):
         "Benchmark & Estimator & Simulator budget & Wall clock (s) & Ratio to REINFORCE \\\\",
         "\\midrule",
     ]
-    for env in BENCHMARKS:
-        runtime = runtime_table(load_runs(results_root, env=env))
+    available = [name for name in BENCHMARKS if has_run(results_root, name)]
+    for env in available:
+        runtime = runtime_table(load_env_runs(results_root, env))
         horizon, flow = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"], MAIN_FLOW[env]
         subset = runtime[runtime["horizon"] == horizon]
         subset = subset[(subset["flow"] == flow) | (subset["algorithm"] == "reinforce")]
@@ -463,7 +525,7 @@ def budget_runtime(results_root):
                 + " \\\\"
             )
             first = False
-        if env != BENCHMARKS[-1]:
+        if env != available[-1]:
             lines.append("\\midrule")
     caption = (
         "Simulator budget and wall-clock cost per run at the headline configuration. "
