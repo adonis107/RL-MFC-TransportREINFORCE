@@ -1,4 +1,4 @@
-# Mean-field control with transport-randomized policy gradients
+# Randomized transport maps for model-free policy-gradient mean-field control
 
 Code for the mean-field control experiments comparing:
 
