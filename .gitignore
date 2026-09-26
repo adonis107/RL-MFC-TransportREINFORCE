@@ -10,11 +10,8 @@ wheels/
 .venv
 
 # Folders
-archive/
 files/
-previous_results/
 results/
-notebooks/
 outputs/
 
 
