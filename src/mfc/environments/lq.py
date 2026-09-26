@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 import torch
 
+from .randomizers import resolve
+
 
 @dataclass(frozen=True)
 class LQConfig:
@@ -69,44 +71,87 @@ class LQ:
     def terminal_reward(self, states, mu):
         return -(self.config.q_T * states.square() + self.config.gamma_T * mu.square())
 
-    def moment_flow(self, theta, lambda_=None):
+    def flows(self, theta, lambda_=None, randomizer=None):
+        """Represented flow m_t and the controlled particle's own moments.
+
+        m_t is the unperturbed mean flow the population block fits; the
+        particle is shown M_t with mean kappa m_t and variance v_t instead, so
+        its own mean mu_t only coincides with m_t when kappa = 1. Returns
+        (m, mu, Sigma), all of length T + 1.
+        """
         lambda_ = self.config.perturbation_scale if lambda_ is None else lambda_
-        mu = [torch.tensor(self.config.mu0, dtype=self.dtype, device=self.device)]
-        Sigma = [torch.tensor(self.config.Sigma0, dtype=self.dtype, device=self.device)]
+        randomizer = resolve(randomizer, self.config.rho)
+        kappa = randomizer.mean_coefficient(lambda_)
+
+        represented = [torch.tensor(self.config.mu0, dtype=self.dtype, device=self.device)]
+        mean = [torch.tensor(self.config.mu0, dtype=self.dtype, device=self.device)]
+        variance = [torch.tensor(self.config.Sigma0, dtype=self.dtype, device=self.device)]
 
         for t in range(self.config.T):
             theta1, theta2 = theta[t]
-            mu.append((self.config.a + self.config.b * theta1 + self.config.b * theta2 + self.config.c) * mu[t])
-            Sigma.append(
-                (self.config.a + self.config.b * theta1).square() * Sigma[t]
-                + (self.config.b * theta2 + self.config.c).square() * lambda_**2 * self.config.rho**2
+            law_variance = randomizer.variance(lambda_)
+            represented.append(
+                (self.config.a + self.config.b * theta1 + self.config.b * theta2 + self.config.c) * represented[t]
+            )
+            mean.append(
+                (self.config.a + self.config.b * theta1) * mean[t]
+                + (self.config.b * theta2 + self.config.c) * kappa * represented[t]
+            )
+            variance.append(
+                (self.config.a + self.config.b * theta1).square() * variance[t]
+                + (self.config.b * theta2 + self.config.c).square() * law_variance
                 + self.config.b**2 * self.config.tau**2
                 + self.config.sigma**2
             )
 
-        return torch.stack(mu), torch.stack(Sigma)
+        return represented, mean, variance
 
-    def objective(self, theta, lambda_=None):
+    def moment_flow(self, theta, lambda_=None, randomizer=None):
+        """The controlled particle's mean and variance flow.
+
+        At lambda = 0, and for any randomizer with kappa = 1, this is also the
+        represented flow; use flows() when the two have to be told apart.
+        """
+        _, mean, variance = self.flows(theta, lambda_, randomizer)
+        return torch.stack(mean), torch.stack(variance)
+
+    def objective(self, theta, lambda_=None, randomizer=None):
         lambda_ = self.config.perturbation_scale if lambda_ is None else lambda_
-        mu, Sigma = self.moment_flow(theta, lambda_)
+        resolved = resolve(randomizer, self.config.rho)
+        kappa = resolved.mean_coefficient(lambda_)
+        represented, mu, Sigma = self.flows(theta, lambda_, randomizer)
         objective = torch.zeros((), dtype=self.dtype, device=self.device)
 
         for t in range(self.config.T):
             theta1, theta2 = theta[t]
-            objective = objective + self.config.q * (Sigma[t] + mu[t].square())
+            # Second moments of the two quantities the cost sees: the state and
+            # the randomized population mean, which are independent.
+            law_mean = kappa * represented[t]
+            law_second = law_mean.square() + resolved.variance(lambda_)
+            state_second = Sigma[t] + mu[t].square()
+            objective = objective + self.config.q * state_second
             objective = objective + self.config.r * (
-                (theta1 + theta2).square() * mu[t].square()
-                + theta1.square() * Sigma[t]
-                + theta2.square() * lambda_**2 * self.config.rho**2
+                theta1.square() * state_second
+                + theta2.square() * law_second
+                + 2.0 * theta1 * theta2 * mu[t] * law_mean
                 + self.config.tau**2
             )
-            objective = objective + self.config.gamma * (lambda_**2 * self.config.rho**2 + mu[t].square())
+            objective = objective + self.config.gamma * law_second
 
+        terminal_mean = kappa * represented[-1]
+        terminal_second = terminal_mean.square() + resolved.variance(lambda_)
         objective = objective + self.config.q_T * (Sigma[-1] + mu[-1].square())
-        objective = objective + self.config.gamma_T * (lambda_**2 * self.config.rho**2 + mu[-1].square())
+        objective = objective + self.config.gamma_T * terminal_second
         return objective
 
     def exact_gradient(self, theta, lambda_=None):
+        """Analytic gradient of the objective under the additive convention.
+
+        This adjoint recursion is written for the reference's additive
+        randomization, Var(M_t) = lambda^2 rho^2 with the mean left alone. It
+        takes no randomizer: for any other one, differentiate objective()
+        directly, which is what the estimators and scripts/decomposition.py do.
+        """
         lambda_ = self.config.perturbation_scale if lambda_ is None else lambda_
         mu, Sigma = self.moment_flow(theta, lambda_)
         p = torch.empty(self.config.T + 1, dtype=self.dtype, device=self.device)

@@ -73,7 +73,7 @@ class Advertising:
     def transition(self, states, mu, actions):
         prob_customer = (mu[..., self.CUSTOMER] + self.config.eta * actions).clamp(max=1.0)
         return torch.stack([1.0 - prob_customer, prob_customer], dim=-1)
-    
+
     def sample(self, states, mu, actions, generator):
         probabilities = self.transition(states, mu, actions)
         flat = torch.multinomial(probabilities.reshape(-1, self.n_states), 1, generator=generator)

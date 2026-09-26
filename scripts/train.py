@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 from mfc.algorithms import (
     ContinuousTransport,
     ContinuousTransportConfig,
+    GaussianTransport,
+    GaussianTransportConfig,
     DiscreteTransport,
     DiscreteTransportConfig,
     MeanFieldQLearning,
@@ -49,6 +51,9 @@ ENVIRONMENTS = {
 DISCRETE_ENVS = {"twostate", "cybersecurity", "distribution", "advertising"}
 CONTINUOUS_ENVS = {"lq", "portfolio"}
 TRANSPORT_ALGORITHMS = {"transport"}
+# Transport on the Gaussian manifold with a likelihood-ratio flow sensitivity: no
+# auxiliary radius, so it is not part of the eta-carrying family above.
+GAUSSIAN_ALGORITHMS = {"gaussian"}
 
 
 def maybe_float(value):
@@ -126,6 +131,8 @@ def asymptotic_bound_scales(args, algorithm):
 
 
 def perturbation_label(algorithm, perturbation, eta):
+    if algorithm == "gaussian":
+        return f"lambda_{perturbation:g}"
     if algorithm == "reinforce":
         return "none"
     if algorithm == "mfqlearning":
@@ -213,6 +220,21 @@ def build_algorithm(args, env):
         )
         return MFReinforce(env, config=config)
 
+    if args.algorithm == "gaussian":
+        if args.env not in CONTINUOUS_ENVS:
+            raise ValueError("Gaussian-manifold transport is only configured for continuous-state environments.")
+        if args.perturbation is None:
+            raise ValueError("Gaussian transport requires --perturbation lambda.")
+        config = GaussianTransportConfig(
+            **common,
+            lambda_=args.perturbation,
+            flow=args.flow,
+            n_flow_particles=args.n_flow_particles,
+            n_law_gradient=args.n_law_gradient,
+            baseline=use_baseline,
+        )
+        return GaussianTransport(env, config=config)
+
     if args.algorithm == "transport":
         if args.perturbation is None:
             raise ValueError("Transport requires --perturbation lambda.")
@@ -294,6 +316,10 @@ def simulator_budget_estimate(algorithm):
         gradient_reuses = 1 if algorithm.config.reuse_state_gradient else particles
         return horizon * particles + horizon * gradient_samples * gradient_reuses + flow_extra
 
+    if isinstance(algorithm, GaussianTransport):
+        # One auxiliary batch, no shifted sub-blocks: n trajectories of length T.
+        return horizon * particles + horizon * algorithm.n_law_gradient + flow_extra
+
     if isinstance(algorithm, ContinuousTransport):
         gradient_samples = algorithm.effective_n_law_gradient
         gradient_reuses = 1 if algorithm.config.reuse_state_gradient else particles
@@ -310,7 +336,7 @@ def simulator_budget_estimate(algorithm):
 
 
 def metadata_eta(args, algorithm):
-    if args.algorithm == "reinforce":
+    if args.algorithm in {"reinforce", "gaussian"}:
         return None
     if args.algorithm == "mfreinforce":
         return algorithm.perturbation_eta
@@ -408,7 +434,7 @@ def default_flow(args):
     so 'exact' is only available there as a single-Gaussian oracle and cannot be
     the default. Everywhere else the exact law recursion remains the default.
     """
-    if args.env in CONTINUOUS_ENVS and args.algorithm in TRANSPORT_ALGORITHMS:
+    if args.env in CONTINUOUS_ENVS and args.algorithm in TRANSPORT_ALGORITHMS | GAUSSIAN_ALGORITHMS:
         return "particle"
     return "exact"
 
@@ -416,7 +442,12 @@ def default_flow(args):
 def parse_args():
     parser = argparse.ArgumentParser(description="Train one MFC experiment.")
     parser.add_argument("--env", choices=ENVIRONMENTS, required=True)
-    parser.add_argument("--algorithm", "--alg", choices=["reinforce", "mfreinforce", "transport", "mfqlearning"], required=True)
+    parser.add_argument(
+        "--algorithm",
+        "--alg",
+        choices=["reinforce", "mfreinforce", "transport", "gaussian", "mfqlearning"],
+        required=True,
+    )
     parser.add_argument("--perturbation", type=maybe_float, default=None)
     parser.add_argument("--eta", type=maybe_float, default=None)
     parser.add_argument("--horizon", "--T", type=int, required=True)

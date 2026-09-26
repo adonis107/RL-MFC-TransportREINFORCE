@@ -3,6 +3,8 @@ from pathlib import Path
 import pandas as pd
 import torch
 
+from mfc.environments.randomizers import randomizer_for_run
+
 from .flows import discrete_law_flow
 from .flows import final_policy_probabilities
 from .io import load_env_and_policy, run_label, runs_dataframe
@@ -11,7 +13,7 @@ from .io import load_env_and_policy, run_label, runs_dataframe
 CONTINUOUS_TRANSPORT_ENVS = {"lq", "portfolio"}
 
 
-def optimize_exact_policy(env, lambda_):
+def optimize_exact_policy(env, lambda_, randomizer=None):
     if not hasattr(env, "objective") or not hasattr(env, "optimal_policy"):
         raise NotImplementedError("Exact policy optimization requires objective and optimal_policy.")
 
@@ -21,7 +23,7 @@ def optimize_exact_policy(env, lambda_):
 
     def closure():
         optimizer.zero_grad()
-        value = env.objective(theta, lambda_=lambda_)
+        value = env.objective(theta, lambda_=lambda_, randomizer=randomizer)
         loss = value if minimize else -value
         loss.backward()
         return loss
@@ -108,14 +110,26 @@ def objective_table(runs):
         if hasattr(env, "objective"):
             row["objective_convention"] = "cost" if metadata["env"] == "lq" else "reward"
             theta = policy if not isinstance(policy, torch.nn.Module) else None
-            analytic_perturbation = not (
-                metadata["algorithm"] == "transport" and metadata["env"] in CONTINUOUS_TRANSPORT_ENVS
+            # Each estimator randomizes the population its own way, so J^lambda
+            # has to be taken under the randomizer the run was trained with.
+            # randomizer_for_run returns None where no closed form exists (a
+            # mixture chart with more than one component), and that is the only
+            # case the perturbed columns are left out.
+            law_randomizer = randomizer_for_run(metadata)
+            analytic_perturbation = (
+                metadata["env"] not in CONTINUOUS_TRANSPORT_ENVS or law_randomizer is not None
             )
+            if metadata["env"] not in CONTINUOUS_TRANSPORT_ENVS:
+                law_randomizer = None
             if theta is not None:
                 with torch.no_grad():
                     row["J0"] = float(env.objective(theta, lambda_=0.0).detach().cpu())
                     if metadata["perturbation"] is not None and analytic_perturbation:
-                        row["Jlambda"] = float(env.objective(theta, lambda_=metadata["perturbation"]).detach().cpu())
+                        row["Jlambda"] = float(
+                            env.objective(
+                                theta, lambda_=metadata["perturbation"], randomizer=law_randomizer
+                            ).detach().cpu()
+                        )
                     if hasattr(env, "optimal_policy"):
                         try:
                             optimal = env.optimal_policy()
@@ -127,15 +141,22 @@ def objective_table(runs):
                         metadata["env"],
                         metadata["horizon"],
                         metadata["perturbation"],
+                        repr(law_randomizer),
                         repr(metadata["env_config"]),
                     )
                     try:
                         if key not in optimum_cache:
-                            optimum_cache[key] = optimize_exact_policy(env, metadata["perturbation"])
+                            optimum_cache[key] = optimize_exact_policy(
+                                env, metadata["perturbation"], law_randomizer
+                            )
                         optimal_lambda = optimum_cache[key]
                         with torch.no_grad():
                             row["Jlambda_star"] = float(
-                                env.objective(optimal_lambda, lambda_=metadata["perturbation"]).detach().cpu()
+                                env.objective(
+                                    optimal_lambda,
+                                    lambda_=metadata["perturbation"],
+                                    randomizer=law_randomizer,
+                                ).detach().cpu()
                             )
                     except NotImplementedError:
                         pass

@@ -74,6 +74,8 @@ def run_label(metadata):
         return "MFQ-learning" if resolution is None else f"MFQ-learning Nm={resolution}"
     if algorithm == "mfreinforce":
         return f"MF-REINFORCE eps={metadata['perturbation']:g}"
+    if algorithm == "gaussian":
+        return f"Transport-Proba lambda={metadata['perturbation']:g}"
     label = f"Transport lambda={metadata['perturbation']:g}"
     eta = metadata.get("eta")
     if eta is not None:

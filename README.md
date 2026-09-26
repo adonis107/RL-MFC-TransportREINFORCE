@@ -1,11 +1,13 @@
-# MFC-Transport-REINFORCE
+# Mean-field control with transport-randomized policy gradients
 
-Code for mean-field control experiments comparing:
+Code for the mean-field control experiments comparing:
 
 - REINFORCE
 - MF-REINFORCE
-- Transport REINFORCE
-- tabular mean-field Q-learning on cybersecurity
+- Transport REINFORCE, with a zero-order population-flow sensitivity
+- Transport-Proba REINFORCE, with a likelihood-ratio population-flow sensitivity
+  (continuous-state benchmarks only)
+- tabular mean-field Q-learning, on cybersecurity
 
 ## Setup
 
@@ -13,103 +15,76 @@ Code for mean-field control experiments comparing:
 uv sync
 ```
 
-Run commands from the repository root.
+Run every command from the repository root.
 
-## Repository layout
+## Layout
 
-- `src/mfc/environments/`: benchmark environments.
-- `src/mfc/algorithms/`: training and gradient estimators.
-- `src/mfc/visualization/`: result loading, plots, tables, and diagnostics.
-- `scripts/`: training, diagnostics, and final output generation.
-- `results/`: saved experiment outputs.
-- `outputs/`: generated figures and tables.
+- `src/mfc/environments/` benchmark environments
+- `src/mfc/algorithms/` training and gradient estimators
+- `src/mfc/visualization/` result loading, plots and tables
+- `scripts/` training, diagnostics and final outputs
+- `results/` saved runs
+- `outputs/` generated figures and tables
 
-## Run one experiment
+## One experiment
 
 ```bash
 uv run python scripts/train.py \
-  --env lq \
-  --algorithm transport \
-  --horizon 20 \
-  --flow particle \
-  --perturbation 0.308084 \
-  --eta 0.429187 \
-  --n-components 1 \
-  --n-train 10000 \
-  --device cpu
+  --env lq --algorithm transport --horizon 20 \
+  --perturbation 0.308084 --eta 0.95 --n-components 1 \
+  --n-train 10000 --device cpu
 ```
 
-Common environments are `twostate`, `cybersecurity`, `distribution`, `advertising`, `lq`, and `portfolio`.
+Environments are `twostate`, `cybersecurity`, `distribution`, `advertising`, `lq`
+and `portfolio`. Algorithms are `reinforce`, `mfreinforce`, `transport`,
+`gaussian` and `mfqlearning`.
 
-## Run the full suite
+`gaussian` is Transport-Proba. It represents the population by the pair
+`(m_t, sigma_t)` of a single Gaussian, randomizes it as
+`m_t^lambda = (1-lambda) m_t + lambda A_t` and
+`Sigma_t^lambda = ((1-lambda) + lambda B_t)^2 sigma_t^2`, and estimates
+`grad m_t` and `grad log sigma_t` by a likelihood ratio rather than by centered
+policy differences. It takes no `--eta`.
 
-The suite runs the current benchmark set on CPU using the bound-derived transport scales from
-`scripts/run.py`. It does not include Kuramoto, adaptive transport, an eta sweep, or LQ `K=3`
-experiments.
+## The full suite
 
 ```bash
 scripts/run_suite.sh
 ```
 
-Useful overrides:
+Useful overrides: `WORKERS=4`, `CORES=18`, `ENVS="lq portfolio"`, `--no-resume`.
+Runs already carrying a `summary.json` are skipped, so the suite resumes.
+
+To follow progress:
 
 ```bash
-WORKERS=4 scripts/run_suite.sh
-CORES=18 WORKERS=6 scripts/run_suite.sh
-scripts/run_suite.sh --no-resume
+for f in $(find results/logs -name '*.log' | sort); do echo "== $f"; tail -n 1 "$f"; done
 ```
 
-On a fresh pod, the typical setup is:
-
-```bash
-apt update
-apt install -y tmux git curl
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source "$HOME/.local/bin/env"
-uv sync
-tmux new -s mfc
-CORES=18 WORKERS=6 scripts/run_suite.sh
-```
-
-Detach from tmux with `Ctrl-b d`, reattach with:
-
-```bash
-tmux attach -t mfc
-```
-
-To inspect progress across running jobs:
-
-```bash
-for f in $(find results/logs -name '*.log' | sort); do
-  echo "== $f =="
-  tail -n 1 "$f"
-done
-```
-
-## Build figures and tables
-
-The full suite calls this automatically after training finishes:
+## Figures and tables
 
 ```bash
 uv run python scripts/make_outputs.py --results-root results
 ```
 
-It writes the final artifacts to:
-
-```text
-outputs/figures/learning_curves.pdf
-outputs/figures/learned_policies.pdf
-outputs/figures/theory_verification.pdf
-outputs/tables/objective_summary.tex
-outputs/tables/budget_runtime.tex
-```
-
-Use `scripts/plot.py` only for exploratory diagnostics from saved runs.
-
-## Theory diagnostics
-
-The final theory figure expects the CSVs created by:
+The decomposition table recomputes a perturbed optimum per scale, so it has its
+own entry point:
 
 ```bash
-uv run python scripts/verify_theory.py --part all
+uv run python scripts/decomposition.py lq portfolio --root results \
+  --tex outputs/tables/continuous_decomposition.tex
 ```
+
+## Diagnostics
+
+```bash
+uv run python scripts/verify_randomizers.py   # closed-form J^lambda against simulation
+uv run python scripts/verify_gaussian.py      # Transport-Proba score, sensitivities, gradient
+uv run python scripts/verify_bounds.py        # error rates in eta, n, M, lambda and B
+uv run python scripts/verify_theory.py        # perturbation estimate and consistency
+uv run python scripts/tune_perturbation.py    # auxiliary scales against the gradient oracle
+uv run python scripts/correction_alignment.py # alignment of the transport correction
+uv run python scripts/lambda_tradeoff.py      # gradient bias and dispersion against lambda
+```
+
+`scripts/plot.py` is for exploratory inspection of saved runs only.

@@ -42,34 +42,6 @@ class DiscreteTransportConfig:
     seed: int = 0
 
 
-@dataclass(frozen=True)
-class AdaptiveDiscreteTransportConfig(DiscreteTransportConfig):
-    adaptive_checkpoint_interval: int = 100
-    adaptive_replications: int = 4
-    contraction_lambda: float = 0.5
-    contraction_eta: float = 0.75
-    target_bias_lambda: float = 0.25
-    target_bias_eta: float = 0.25
-    bias_order_lambda: float = 1.0
-    bias_order_eta: float = 1.0
-    controller_lr_lambda: float = 0.05
-    controller_lr_eta: float = 0.05
-    controller_beta1_lambda: float = 0.9
-    controller_beta1_eta: float = 0.9
-    controller_beta2_lambda: float = 0.999
-    controller_beta2_eta: float = 0.999
-    controller_eps_lambda: float = 1e-8
-    controller_eps_eta: float = 1e-8
-    diagnostic_delta: float = 1e-12
-    lambda_min: float = 0.025
-    lambda_max: float = 0.95
-    eta_min: float = 0.2
-    eta_max: float = 0.98
-    direction_cosine_min: float = 0.0
-    direction_norm_min: float = 1e-12
-    direction_z: float = 1.0
-
-
 class DiscreteTransport(MFReinforce):
     def __init__(self, env, policy=None, config=DiscreteTransportConfig()):
         super().__init__(env, policy=policy, config=config)
@@ -313,352 +285,27 @@ class DiscreteTransport(MFReinforce):
         return gradient, objective
 
 
-class AdaptiveDiscreteTransport(DiscreteTransport):
-    def __init__(self, env, policy=None, config=AdaptiveDiscreteTransportConfig()):
-        super().__init__(env, policy=policy, config=config)
-        self._lambda = self._clamp_scale(config.lambda_ if config.lambda_ is not None else 0.2, config.lambda_min, config.lambda_max)
-        self._eta = self._clamp_scale(config.eta if config.eta is not None else 0.8, config.eta_min, config.eta_max)
-        self._rho_lambda = self._scale_to_logit(self._lambda, config.lambda_min, config.lambda_max)
-        self._rho_eta = self._scale_to_logit(self._eta, config.eta_min, config.eta_max)
-        self._moment_lambda = 0.0
-        self._moment_eta = 0.0
-        self._second_lambda = 0.0
-        self._second_eta = 0.0
-        self._controller_steps = {"lambda": 0, "eta": 0}
-
-    @property
-    def lambda_(self):
-        return self._lambda
-
-    @property
-    def eta(self):
-        return self._eta
-
-    @staticmethod
-    def _clamp_scale(value, lower, upper):
-        return min(max(float(value), lower), upper)
-
-    @staticmethod
-    def _scale_to_logit(value, lower, upper):
-        ratio = (value - lower) / (upper - lower)
-        ratio = min(max(ratio, 1e-12), 1.0 - 1e-12)
-        return math.log(ratio / (1.0 - ratio))
-
-    @staticmethod
-    def _logit_to_scale(rho, lower, upper):
-        sigmoid = 1.0 / (1.0 + math.exp(-rho))
-        return lower + (upper - lower) * sigmoid
-
-    @staticmethod
-    def _covariance_trace(samples):
-        if samples.shape[0] < 2:
-            return torch.zeros((), dtype=samples.dtype, device=samples.device)
-        centered = samples - samples.mean(dim=0)
-        return centered.square().sum() / (samples.shape[0] - 1)
-
-    @staticmethod
-    def _cosine(left, right):
-        denominator = left.norm() * right.norm()
-        if not torch.isfinite(denominator).item() or denominator.item() <= 0:
-            return float("nan")
-        return float((left @ right / denominator).detach().cpu())
-
-    def _controller_update(self, name, signal):
-        config = self.config
-        beta1 = getattr(config, f"controller_beta1_{name}")
-        beta2 = getattr(config, f"controller_beta2_{name}")
-        step_size = getattr(config, f"controller_lr_{name}")
-        eps = getattr(config, f"controller_eps_{name}")
-
-        moment_name = f"_moment_{name}"
-        second_name = f"_second_{name}"
-        rho_name = f"_rho_{name}"
-
-        self._controller_steps[name] += 1
-        steps = self._controller_steps[name]
-
-        moment = beta1 * getattr(self, moment_name) + (1.0 - beta1) * signal
-        second = beta2 * getattr(self, second_name) + (1.0 - beta2) * signal**2
-        setattr(self, moment_name, moment)
-        setattr(self, second_name, second)
-
-        corrected_moment = moment / (1.0 - beta1**steps)
-        corrected_second = second / (1.0 - beta2**steps)
-        rho = getattr(self, rho_name) - step_size * corrected_moment / (corrected_second**0.5 + eps)
-        setattr(self, rho_name, rho)
-
-    def _update_scales_from_logits(self):
-        config = self.config
-        self._lambda = self._logit_to_scale(self._rho_lambda, config.lambda_min, config.lambda_max)
-        self._eta = self._logit_to_scale(self._rho_eta, config.eta_min, config.eta_max)
-
-    def adaptive_diagnostic(self, seed):
-        config = self.config
-        lambda_plus = self.lambda_
-        eta_plus = self.eta
-        lambda_minus = max(config.lambda_min, config.contraction_lambda * lambda_plus)
-        eta_minus = max(config.eta_min, config.contraction_eta * eta_plus)
-        effective_c_lambda = max(lambda_minus / lambda_plus, 1e-12)
-        effective_c_eta = max(eta_minus / eta_plus, 1e-12)
-
-        g_pp = []
-        g_mp = []
-        g_pm = []
-        g_mm = []
-        for replication in range(config.adaptive_replications):
-            base_seed = seed + replication * 100_000
-            law_generator = torch.Generator(device=self.env.device)
-            law_generator.manual_seed(base_seed + 30_000)
-            initial_distribution = self.sample_initial_distribution(law_generator)
-            laws, _ = self.mean_field_law_flow(seed=base_seed + 20_000, initial_distribution=initial_distribution)
-
-            sensitivities_plus = self.estimate_state_sensitivities(
-                laws,
-                base_seed + 10_000,
-                initial_distribution=initial_distribution,
-                eta=eta_plus,
-            )
-            sensitivities_minus = self.estimate_state_sensitivities(
-                laws,
-                base_seed + 40_000,
-                initial_distribution=initial_distribution,
-                eta=eta_minus,
-            )
-            components_plus = self.batched_trajectory_components(
-                laws,
-                base_seed,
-                initial_distribution=initial_distribution,
-                lambda_=lambda_plus,
-            )
-            components_minus = self.batched_trajectory_components(
-                laws,
-                base_seed + 50_000,
-                initial_distribution=initial_distribution,
-                lambda_=lambda_minus,
-            )
-
-            action_gradient, weights, law_scores, _ = components_plus
-            g_pp.append(
-                self.combine_batched_trajectory_components(
-                    action_gradient,
-                    weights,
-                    law_scores,
-                    sensitivities_plus,
-                    lambda_=lambda_plus,
-                ).detach()
-            )
-            g_pm.append(
-                self.combine_batched_trajectory_components(
-                    action_gradient,
-                    weights,
-                    law_scores,
-                    sensitivities_minus,
-                    lambda_=lambda_plus,
-                ).detach()
-            )
-
-            action_gradient, weights, law_scores, _ = components_minus
-            g_mp.append(
-                self.combine_batched_trajectory_components(
-                    action_gradient,
-                    weights,
-                    law_scores,
-                    sensitivities_plus,
-                    lambda_=lambda_minus,
-                ).detach()
-            )
-            g_mm.append(
-                self.combine_batched_trajectory_components(
-                    action_gradient,
-                    weights,
-                    law_scores,
-                    sensitivities_minus,
-                    lambda_=lambda_minus,
-                ).detach()
-            )
-
-        g_pp = torch.stack(g_pp)
-        g_mp = torch.stack(g_mp)
-        g_pm = torch.stack(g_pm)
-        g_mm = torch.stack(g_mm)
-
-        delta_lambda = 0.5 * ((g_pp - g_mp) + (g_pm - g_mm))
-        delta_eta = 0.5 * ((g_pp - g_pm) + (g_mp - g_mm))
-        mean_delta_lambda = delta_lambda.mean(dim=0)
-        mean_delta_eta = delta_eta.mean(dim=0)
-
-        # Debiased estimates of ||E[Delta]||^2. A non-positive value does not mean
-        # the bias is zero; it means the replications cannot resolve it, since the
-        # variance correction exceeds the squared mean. Treating that case as zero
-        # bias makes the controller read "variance dominates" and drive the scale
-        # to its upper bound, so the two cases are tracked separately below.
-        raw_lambda = (
-            mean_delta_lambda.norm().square() - self._covariance_trace(delta_lambda) / config.adaptive_replications
-        )
-        raw_eta = (
-            mean_delta_eta.norm().square() - self._covariance_trace(delta_eta) / config.adaptive_replications
-        )
-        resolved_lambda = bool((raw_lambda > 0.0).item())
-        resolved_eta = bool((raw_eta > 0.0).item())
-        discrepancy_lambda = raw_lambda.clamp_min(0.0)
-        discrepancy_eta = raw_eta.clamp_min(0.0)
-        bias_lambda = discrepancy_lambda / (1.0 - effective_c_lambda**config.bias_order_lambda) ** 2
-        bias_eta = discrepancy_eta / (1.0 - effective_c_eta**config.bias_order_eta) ** 2
-        variance = self._covariance_trace(g_pp)
-
-        z_lambda = float(torch.log((bias_lambda + config.diagnostic_delta) / (config.target_bias_lambda * variance + config.diagnostic_delta)).detach().cpu())
-        z_eta = float(torch.log((bias_eta + config.diagnostic_delta) / (config.target_bias_eta * variance + config.diagnostic_delta)).detach().cpu())
-
-        mean_pp = g_pp.mean(dim=0)
-        mean_mp = g_mp.mean(dim=0)
-        mean_pm = g_pm.mean(dim=0)
-        mean_mm = g_mm.mean(dim=0)
-        lambda_high = 0.5 * (mean_pp + mean_pm)
-        lambda_low = 0.5 * (mean_mp + mean_mm)
-        eta_high = 0.5 * (mean_pp + mean_mp)
-        eta_low = 0.5 * (mean_pm + mean_mm)
-        lambda_cosine = self._cosine(lambda_high, lambda_low)
-        eta_cosine = self._cosine(eta_high, eta_low)
-
-        if (
-            lambda_high.norm().item() > config.direction_norm_min
-            and lambda_low.norm().item() > config.direction_norm_min
-            and math.isfinite(lambda_cosine)
-            and lambda_cosine < config.direction_cosine_min
-        ):
-            z_lambda = max(z_lambda, config.direction_z)
-            resolved_lambda = True
-        if (
-            eta_high.norm().item() > config.direction_norm_min
-            and eta_low.norm().item() > config.direction_norm_min
-            and math.isfinite(eta_cosine)
-            and eta_cosine < config.direction_cosine_min
-        ):
-            z_eta = max(z_eta, config.direction_z)
-            resolved_eta = True
-
-        if resolved_lambda:
-            self._controller_update("lambda", z_lambda)
-        if resolved_eta:
-            self._controller_update("eta", z_eta)
-        self._update_scales_from_logits()
-
-        return {
-            "adaptive_lambda_before": lambda_plus,
-            "adaptive_eta_before": eta_plus,
-            "adaptive_lambda_after": self.lambda_,
-            "adaptive_eta_after": self.eta,
-            "adaptive_lambda_contracted": lambda_minus,
-            "adaptive_eta_contracted": eta_minus,
-            "adaptive_z_lambda": z_lambda,
-            "adaptive_z_eta": z_eta,
-            "adaptive_lambda_resolved": resolved_lambda,
-            "adaptive_eta_resolved": resolved_eta,
-            "adaptive_bias_lambda": float(bias_lambda.detach().cpu()),
-            "adaptive_bias_eta": float(bias_eta.detach().cpu()),
-            "adaptive_variance": float(variance.detach().cpu()),
-            "adaptive_lambda_cosine": lambda_cosine,
-            "adaptive_eta_cosine": eta_cosine,
-        }
-
-    def train(self):
-        setup_started_at = synchronized_time(self.env.device)
-        optimizer = self.optimizer()
-        setup_seconds = synchronized_time(self.env.device) - setup_started_at
-        history = {
-            "objective": [],
-            "validation_objective": [],
-            "gradient_norm": [],
-            "lambda": [],
-            "eta": [],
-            "adaptive_step": [],
-            "adaptive_lambda_before": [],
-            "adaptive_eta_before": [],
-            "adaptive_lambda_after": [],
-            "adaptive_eta_after": [],
-            "adaptive_lambda_contracted": [],
-            "adaptive_eta_contracted": [],
-            "adaptive_z_lambda": [],
-            "adaptive_lambda_resolved": [],
-            "adaptive_eta_resolved": [],
-            "adaptive_z_eta": [],
-            "adaptive_bias_lambda": [],
-            "adaptive_bias_eta": [],
-            "adaptive_variance": [],
-            "adaptive_lambda_cosine": [],
-            "adaptive_eta_cosine": [],
-            "train_step_seconds": [],
-            "validation_seconds": [],
-            "setup_seconds": [setup_seconds],
-        }
-
-        for episode in range(self.n_train):
-            step_started_at = synchronized_time(self.env.device)
-            gradient, objective = self.estimate_gradient(self.config.seed + episode * (self.n_particles + 1))
-
-            optimizer.zero_grad()
-            self.set_flat_gradient(-gradient)
-            optimizer.step()
-            objective_value = float(objective.detach().cpu())
-            gradient_norm_value = float(gradient.norm().detach().cpu())
-
-            checkpoint_interval = self.config.adaptive_checkpoint_interval
-            if checkpoint_interval and (episode + 1) % checkpoint_interval == 0:
-                diagnostic = self.adaptive_diagnostic(self.config.seed + 1_000_000 + episode * 10_000)
-                history["adaptive_step"].append(episode + 1)
-                for key, value in diagnostic.items():
-                    history[key].append(value)
-
-            history["train_step_seconds"].append(synchronized_time(self.env.device) - step_started_at)
-            history["objective"].append(objective_value)
-            history["gradient_norm"].append(gradient_norm_value)
-            history["lambda"].append(self.lambda_)
-            history["eta"].append(self.eta)
-            report_progress(episode, self.n_train, history)
-
-            if self.validation_interval and (episode + 1) % self.validation_interval == 0:
-                validation_started_at = synchronized_time(self.env.device)
-                with torch.no_grad():
-                    validation = self.evaluate(seed=self.config.seed + self.n_train)
-                validation_value = float(validation.detach().cpu())
-                history["validation_seconds"].append(synchronized_time(self.env.device) - validation_started_at)
-                history["validation_objective"].append(validation_value)
-
-        return self.policy, history
-
-
 def train_discrete_transport(env, policy=None, config=DiscreteTransportConfig()):
     return DiscreteTransport(env, policy=policy, config=config).train()
 
 
-def train_adaptive_discrete_transport(env, policy=None, config=AdaptiveDiscreteTransportConfig()):
-    return AdaptiveDiscreteTransport(env, policy=policy, config=config).train()
-
-
 @dataclass(frozen=True)
 class ContinuousTransportConfig:
-    """Configuration of the Gaussian-mixture transport estimator.
+    """Blocks and chart of the Gaussian-mixture transport estimator.
 
-    n_particles is the number B of main trajectories, n_law_gradient the number n
-    of auxiliary trajectories, and n_law_particles (through n_flow_particles) the
-    number M of population particles that the mixture is fitted to.
+    n_particles is the main block B, n_law_gradient the auxiliary block n, and
+    n_law_particles (through n_flow_particles) the population block M the
+    mixture is fitted to. n_components and the bounds below describe the chart
+    and keep EM away from a covariance collapsing onto one observation.
 
-    The block from n_components to mean_radius describes the chart: K components
-    and the bounds of the fitting set that keep EM away from a covariance
-    collapsing onto one observation. jacobian_floor is the local-identification
-    safeguard: it is the smallest singular value of A, relative to its largest,
-    that is still treated as identified. Raising K past what the population law
-    needs leaves the extra components undetermined, and the run then reports
-    dropped directions in the sensitivity_fallbacks history entry.
+    jacobian_floor is the local-identification safeguard: the smallest singular
+    value of A, relative to its largest, still treated as identified. Raising K
+    past what the population law needs leaves the extra components undetermined
+    and the run reports dropped directions in sensitivity_fallbacks.
 
-    Two budget rules are worth knowing. The floor matters more the longer the
-    horizon, because the represented law of a smoothing dynamic drifts toward a
-    single Gaussian and leaves the extra components less identified at every
-    step. And n_law_gradient has to grow with the number of policy parameters,
-    not only satisfy n eta^2 >= 1: B is a q_K by d_theta matrix estimated from
-    n trajectories, and its error is amplified once per time step by the
-    sensitivity recursion. A few dozen auxiliary trajectories are enough for a
-    tabular policy and are not enough for a network.
+    n_law_gradient has to grow with the number of policy parameters, not merely
+    satisfy n eta^2 >= 1: B is a q_K by d_theta matrix estimated from n
+    trajectories, and its error is amplified once per time step.
     """
 
     n_train: int | None = None
@@ -687,34 +334,6 @@ class ContinuousTransportConfig:
     baseline: bool = True
     reuse_state_gradient: bool = True
     seed: int = 0
-
-
-@dataclass(frozen=True)
-class AdaptiveContinuousTransportConfig(ContinuousTransportConfig):
-    adaptive_checkpoint_interval: int = 100
-    adaptive_replications: int = 4
-    contraction_lambda: float = 0.5
-    contraction_eta: float = 0.75
-    target_bias_lambda: float = 0.25
-    target_bias_eta: float = 0.25
-    bias_order_lambda: float = 1.0
-    bias_order_eta: float = 1.0
-    controller_lr_lambda: float = 0.05
-    controller_lr_eta: float = 0.05
-    controller_beta1_lambda: float = 0.9
-    controller_beta1_eta: float = 0.9
-    controller_beta2_lambda: float = 0.999
-    controller_beta2_eta: float = 0.999
-    controller_eps_lambda: float = 1e-8
-    controller_eps_eta: float = 1e-8
-    diagnostic_delta: float = 1e-12
-    lambda_min: float = 0.025
-    lambda_max: float = 0.95
-    eta_min: float = 0.2
-    eta_max: float = 0.98
-    direction_cosine_min: float = 0.0
-    direction_norm_min: float = 1e-12
-    direction_z: float = 1.0
 
 
 class ContinuousTransport:
@@ -1152,7 +771,7 @@ class ContinuousTransport:
             # time otherwise. This is what keeps the fitted coordinate on the
             # same local root of the likelihood equation as theta moves, and it
             # starts EM from a nearly converged fit after the first update.
-            previous = self.fitted_coordinates if update_cache else None
+            previous = self.fitted_coordinates
             warm_start = previous[t] if previous is not None and t < len(previous) else coordinate
             coordinate = self.mixture.fit(
                 particles,
@@ -1283,13 +902,19 @@ class ContinuousTransport:
         shifted.reshape(-1)[parameter_index] += amount
         return shifted
 
-    def coordinates_under_policy(self, policy, seed, n_particles):
-        """Fit the represented flow under a temporary policy without changing caches."""
+    def coordinates_under_policy(self, policy, seed, n_particles, warm_start=None):
+        """Fit the represented flow under a temporary policy without changing caches.
+
+        The shifted policy differs from the current one by a single coordinate of size eta, so
+        the unshifted fit is a good starting point: warm starting from it keeps the shifted fit
+        on the same local root of the likelihood equation, which is what makes the difference of
+        the two coordinates a sensitivity rather than a relabelling.
+        """
         current_policy = self.policy
         current_cache = self.fitted_coordinates
         try:
             self.policy = policy
-            self.fitted_coordinates = None
+            self.fitted_coordinates = warm_start
             coordinates, _ = self.population_coordinates(
                 seed=seed,
                 jacobians=False,
@@ -1327,11 +952,13 @@ class ContinuousTransport:
                 plus_policy,
                 seed + 10_000 * parameter_index + 1,
                 n_per_shift,
+                warm_start=coordinates,
             )
             minus = self.coordinates_under_policy(
                 minus_policy,
                 seed + 10_000 * parameter_index + 2,
                 n_per_shift,
+                warm_start=coordinates,
             )
             for t in range(1, self.horizon + 1):
                 sensitivities[t][:, parameter_index] = (plus[t] - minus[t]) / (2.0 * eta)
@@ -1552,307 +1179,5 @@ class ContinuousTransport:
         return self.policy, history
 
 
-
-class AdaptiveContinuousTransport(ContinuousTransport):
-    def __init__(self, env, policy=None, config=AdaptiveContinuousTransportConfig()):
-        super().__init__(env, policy=policy, config=config)
-        self._lambda = AdaptiveDiscreteTransport._clamp_scale(
-            config.lambda_ if config.lambda_ is not None else 0.2,
-            config.lambda_min,
-            config.lambda_max,
-        )
-        self._eta = AdaptiveDiscreteTransport._clamp_scale(
-            config.eta if config.eta is not None else 0.8,
-            config.eta_min,
-            config.eta_max,
-        )
-        self._rho_lambda = AdaptiveDiscreteTransport._scale_to_logit(self._lambda, config.lambda_min, config.lambda_max)
-        self._rho_eta = AdaptiveDiscreteTransport._scale_to_logit(self._eta, config.eta_min, config.eta_max)
-        self._moment_lambda = 0.0
-        self._moment_eta = 0.0
-        self._second_lambda = 0.0
-        self._second_eta = 0.0
-        self._controller_steps = {"lambda": 0, "eta": 0}
-
-    @property
-    def lambda_(self):
-        return self._lambda
-
-    @property
-    def eta(self):
-        return self._eta
-
-    def _controller_update(self, name, signal):
-        config = self.config
-        beta1 = getattr(config, f"controller_beta1_{name}")
-        beta2 = getattr(config, f"controller_beta2_{name}")
-        step_size = getattr(config, f"controller_lr_{name}")
-        eps = getattr(config, f"controller_eps_{name}")
-
-        moment_name = f"_moment_{name}"
-        second_name = f"_second_{name}"
-        rho_name = f"_rho_{name}"
-
-        self._controller_steps[name] += 1
-        steps = self._controller_steps[name]
-
-        moment = beta1 * getattr(self, moment_name) + (1.0 - beta1) * signal
-        second = beta2 * getattr(self, second_name) + (1.0 - beta2) * signal**2
-        setattr(self, moment_name, moment)
-        setattr(self, second_name, second)
-
-        corrected_moment = moment / (1.0 - beta1**steps)
-        corrected_second = second / (1.0 - beta2**steps)
-        rho = getattr(self, rho_name) - step_size * corrected_moment / (corrected_second**0.5 + eps)
-        setattr(self, rho_name, rho)
-
-    def _update_scales_from_logits(self):
-        config = self.config
-        self._lambda = AdaptiveDiscreteTransport._logit_to_scale(self._rho_lambda, config.lambda_min, config.lambda_max)
-        self._eta = AdaptiveDiscreteTransport._logit_to_scale(self._rho_eta, config.eta_min, config.eta_max)
-
-    def adaptive_diagnostic(self, seed):
-        config = self.config
-        lambda_plus = self.lambda_
-        eta_plus = self.eta
-        lambda_minus = max(config.lambda_min, config.contraction_lambda * lambda_plus)
-        eta_minus = max(config.eta_min, config.contraction_eta * eta_plus)
-        effective_c_lambda = max(lambda_minus / lambda_plus, 1e-12)
-        effective_c_eta = max(eta_minus / eta_plus, 1e-12)
-
-        g_pp = []
-        g_mp = []
-        g_pm = []
-        g_mm = []
-        for replication in range(config.adaptive_replications):
-            base_seed = seed + replication * 100_000
-            coordinates, _ = self.population_coordinates(seed=base_seed + 20_000, jacobians=False)
-            sensitivities_plus = self.estimate_coordinate_sensitivities(
-                coordinates,
-                seed=base_seed + 10_000,
-                eta=eta_plus,
-            )
-            sensitivities_minus = self.estimate_coordinate_sensitivities(
-                coordinates,
-                seed=base_seed + 40_000,
-                eta=eta_minus,
-            )
-            components_plus = self.batched_trajectory_components(coordinates, base_seed, lambda_=lambda_plus)
-            components_minus = self.batched_trajectory_components(coordinates, base_seed + 50_000, lambda_=lambda_minus)
-
-            action_gradient, weights, perturbed_coordinates, _ = components_plus
-            g_pp.append(
-                self.combine_batched_trajectory_components(
-                    action_gradient,
-                    weights,
-                    perturbed_coordinates,
-                    sensitivities_plus,
-                    coordinates,
-                    lambda_=lambda_plus,
-                ).detach()
-            )
-            g_pm.append(
-                self.combine_batched_trajectory_components(
-                    action_gradient,
-                    weights,
-                    perturbed_coordinates,
-                    sensitivities_minus,
-                    coordinates,
-                    lambda_=lambda_plus,
-                ).detach()
-            )
-
-            action_gradient, weights, perturbed_coordinates, _ = components_minus
-            g_mp.append(
-                self.combine_batched_trajectory_components(
-                    action_gradient,
-                    weights,
-                    perturbed_coordinates,
-                    sensitivities_plus,
-                    coordinates,
-                    lambda_=lambda_minus,
-                ).detach()
-            )
-            g_mm.append(
-                self.combine_batched_trajectory_components(
-                    action_gradient,
-                    weights,
-                    perturbed_coordinates,
-                    sensitivities_minus,
-                    coordinates,
-                    lambda_=lambda_minus,
-                ).detach()
-            )
-
-        g_pp = torch.stack(g_pp)
-        g_mp = torch.stack(g_mp)
-        g_pm = torch.stack(g_pm)
-        g_mm = torch.stack(g_mm)
-
-        delta_lambda = 0.5 * ((g_pp - g_mp) + (g_pm - g_mm))
-        delta_eta = 0.5 * ((g_pp - g_pm) + (g_mp - g_mm))
-        mean_delta_lambda = delta_lambda.mean(dim=0)
-        mean_delta_eta = delta_eta.mean(dim=0)
-
-        # See AdaptiveDiscreteTransport.adaptive_diagnostic: a non-positive debiased
-        # estimate means the bias is unresolved at this replication count, not that
-        # it is zero, and the two must not be conflated by the controller.
-        raw_lambda = (
-            mean_delta_lambda.norm().square()
-            - AdaptiveDiscreteTransport._covariance_trace(delta_lambda) / config.adaptive_replications
-        )
-        raw_eta = (
-            mean_delta_eta.norm().square()
-            - AdaptiveDiscreteTransport._covariance_trace(delta_eta) / config.adaptive_replications
-        )
-        resolved_lambda = bool((raw_lambda > 0.0).item())
-        resolved_eta = bool((raw_eta > 0.0).item())
-        discrepancy_lambda = raw_lambda.clamp_min(0.0)
-        discrepancy_eta = raw_eta.clamp_min(0.0)
-        bias_lambda = discrepancy_lambda / (1.0 - effective_c_lambda**config.bias_order_lambda) ** 2
-        bias_eta = discrepancy_eta / (1.0 - effective_c_eta**config.bias_order_eta) ** 2
-        variance = AdaptiveDiscreteTransport._covariance_trace(g_pp)
-
-        z_lambda = float(
-            torch.log(
-                (bias_lambda + config.diagnostic_delta)
-                / (config.target_bias_lambda * variance + config.diagnostic_delta)
-            )
-            .detach()
-            .cpu()
-        )
-        z_eta = float(
-            torch.log(
-                (bias_eta + config.diagnostic_delta)
-                / (config.target_bias_eta * variance + config.diagnostic_delta)
-            )
-            .detach()
-            .cpu()
-        )
-
-        mean_pp = g_pp.mean(dim=0)
-        mean_mp = g_mp.mean(dim=0)
-        mean_pm = g_pm.mean(dim=0)
-        mean_mm = g_mm.mean(dim=0)
-        lambda_high = 0.5 * (mean_pp + mean_pm)
-        lambda_low = 0.5 * (mean_mp + mean_mm)
-        eta_high = 0.5 * (mean_pp + mean_mp)
-        eta_low = 0.5 * (mean_pm + mean_mm)
-        lambda_cosine = AdaptiveDiscreteTransport._cosine(lambda_high, lambda_low)
-        eta_cosine = AdaptiveDiscreteTransport._cosine(eta_high, eta_low)
-
-        if (
-            lambda_high.norm().item() > config.direction_norm_min
-            and lambda_low.norm().item() > config.direction_norm_min
-            and math.isfinite(lambda_cosine)
-            and lambda_cosine < config.direction_cosine_min
-        ):
-            z_lambda = max(z_lambda, config.direction_z)
-            resolved_lambda = True
-        if (
-            eta_high.norm().item() > config.direction_norm_min
-            and eta_low.norm().item() > config.direction_norm_min
-            and math.isfinite(eta_cosine)
-            and eta_cosine < config.direction_cosine_min
-        ):
-            z_eta = max(z_eta, config.direction_z)
-            resolved_eta = True
-
-        if resolved_lambda:
-            self._controller_update("lambda", z_lambda)
-        if resolved_eta:
-            self._controller_update("eta", z_eta)
-        self._update_scales_from_logits()
-
-        return {
-            "adaptive_lambda_before": lambda_plus,
-            "adaptive_eta_before": eta_plus,
-            "adaptive_lambda_after": self.lambda_,
-            "adaptive_eta_after": self.eta,
-            "adaptive_lambda_contracted": lambda_minus,
-            "adaptive_eta_contracted": eta_minus,
-            "adaptive_z_lambda": z_lambda,
-            "adaptive_z_eta": z_eta,
-            "adaptive_lambda_resolved": resolved_lambda,
-            "adaptive_eta_resolved": resolved_eta,
-            "adaptive_bias_lambda": float(bias_lambda.detach().cpu()),
-            "adaptive_bias_eta": float(bias_eta.detach().cpu()),
-            "adaptive_variance": float(variance.detach().cpu()),
-            "adaptive_lambda_cosine": lambda_cosine,
-            "adaptive_eta_cosine": eta_cosine,
-        }
-
-    def train(self):
-        setup_started_at = synchronized_time(self.env.device)
-        optimizer = self.optimizer()
-        setup_seconds = synchronized_time(self.env.device) - setup_started_at
-        history = {
-            "objective": [],
-            "validation_objective": [],
-            "gradient_norm": [],
-            "sensitivity_fallbacks": [],
-            "lambda": [],
-            "eta": [],
-            "adaptive_step": [],
-            "adaptive_lambda_before": [],
-            "adaptive_eta_before": [],
-            "adaptive_lambda_after": [],
-            "adaptive_eta_after": [],
-            "adaptive_lambda_contracted": [],
-            "adaptive_eta_contracted": [],
-            "adaptive_z_lambda": [],
-            "adaptive_lambda_resolved": [],
-            "adaptive_eta_resolved": [],
-            "adaptive_z_eta": [],
-            "adaptive_bias_lambda": [],
-            "adaptive_bias_eta": [],
-            "adaptive_variance": [],
-            "adaptive_lambda_cosine": [],
-            "adaptive_eta_cosine": [],
-            "train_step_seconds": [],
-            "validation_seconds": [],
-            "setup_seconds": [setup_seconds],
-        }
-
-        for episode in range(self.n_train):
-            step_started_at = synchronized_time(self.env.device)
-            gradient, objective = self.estimate_gradient(self.config.seed + episode * (self.n_particles + 1))
-
-            optimizer.zero_grad()
-            self.set_flat_gradient(-gradient)
-            optimizer.step()
-            objective_value = float(objective.detach().cpu())
-            gradient_norm_value = float(gradient.norm().detach().cpu())
-
-            checkpoint_interval = self.config.adaptive_checkpoint_interval
-            if checkpoint_interval and (episode + 1) % checkpoint_interval == 0:
-                diagnostic = self.adaptive_diagnostic(self.config.seed + 1_000_000 + episode * 10_000)
-                history["adaptive_step"].append(episode + 1)
-                for key, value in diagnostic.items():
-                    history[key].append(value)
-
-            history["train_step_seconds"].append(synchronized_time(self.env.device) - step_started_at)
-            history["objective"].append(objective_value)
-            history["gradient_norm"].append(gradient_norm_value)
-            history["sensitivity_fallbacks"].append(self.sensitivity_fallbacks)
-            history["lambda"].append(self.lambda_)
-            history["eta"].append(self.eta)
-            report_progress(episode, self.n_train, history)
-
-            if self.validation_interval and (episode + 1) % self.validation_interval == 0:
-                validation_started_at = synchronized_time(self.env.device)
-                with torch.no_grad():
-                    validation = self.evaluate(seed=self.config.seed + self.n_train)
-                validation_value = float(validation.detach().cpu())
-                history["validation_seconds"].append(synchronized_time(self.env.device) - validation_started_at)
-                history["validation_objective"].append(validation_value)
-
-        return self.policy, history
-
-
 def train_continuous_transport(env, policy=None, config=ContinuousTransportConfig()):
     return ContinuousTransport(env, policy=policy, config=config).train()
-
-
-def train_adaptive_continuous_transport(env, policy=None, config=AdaptiveContinuousTransportConfig()):
-    return AdaptiveContinuousTransport(env, policy=policy, config=config).train()

@@ -21,7 +21,6 @@ is available to the training algorithms.
 """
 
 import argparse
-import math
 from pathlib import Path
 
 import pandas as pd

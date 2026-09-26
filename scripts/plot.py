@@ -65,14 +65,6 @@ def sort_key(value):
     return value
 
 
-def run_score(run):
-    summary = run.get("summary", {})
-    value = summary.get("last_validation_objective")
-    if value is None:
-        value = summary.get("last_objective")
-    return float("-inf") if value is None else value
-
-
 def validation_overview_runs(horizon_runs, flow=None):
     selected = []
     for run in horizon_runs:

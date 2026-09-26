@@ -4,5 +4,4 @@ from .distribution import Distribution, DistributionPolicy, DistributionConfig
 from .twostate import TwoState, TwoStateConfig
 
 from .lq import LQ, LQConfig
-from .kuramoto import Kuramoto, KuramotoPolicy, KuramotoConfig
 from .portfolio import Portfolio, PortfolioConfig

@@ -80,7 +80,7 @@ TRANSPORT_ALLOCATIONS = {
     "lq": {
         "horizon": 20,
         "M": 150,
-        "n": 160,
+        "n": 10240,
         "B": 111,
         "updates": 10_000,
         "lr": 1e-3,
@@ -89,7 +89,7 @@ TRANSPORT_ALLOCATIONS = {
     "portfolio": {
         "horizon": 10,
         "M": 100,
-        "n": 700,
+        "n": 5120,
         "B": 211,
         "updates": 50_000,
         "lr": 1e-2,
@@ -115,21 +115,10 @@ def effective_auxiliary_samples(env):
 
 
 # Auxiliary radius, measured rather than derived. Balancing the error bound gives
-# eta ~ n^(-1/4) in finite state space and n^(-1/6) in continuous state space, but that is the
-# minimizer of the bound with its constants dropped. The true minimizer is (b/(a n))^(1/4), and
-# here the variance constant b exceeds the bias constant a by orders of magnitude: the auxiliary
-# score is heavy-tailed and enters multiplied by (1 - eta)/eta, which is 3.09 at eta = 0.2445
-# against 0.02 at eta = 0.98. When b/(a n) > 1 the unconstrained minimizer leaves the admissible
-# range and the optimum sits at its top. Measured against the distribution-planning gradient
-# oracle, the asymptotic eta = 0.2445 costs a factor of 8100 in gradient root-mean-square error
-# against eta = 0.98 (6538.6 against 0.804), which is why it must not be derived from the bound.
-# Benchmarks absent here fall back to the asymptotic rule.
-# The continuous estimator is far less sensitive than the finite-state one, because its score is
-# Gaussian and enters as 1/eta rather than (1 - eta)/eta on a heavy-tailed score: on the
-# linear-quadratic benchmark the asymptotic eta = 0.4292 costs a factor of 2.2 in gradient
-# root-mean-square error against eta = 0.95, not 8100. The measured optimum is monotone in eta over
-# the tested range, with the bias flat, so the radius sits at the top of the admissible range in
-# both state spaces.
+# eta ~ n^(-1/4) in finite state space and n^(-1/6) in continuous state space, but the
+# constants it drops are lopsided by two orders of magnitude, so the minimiser sits at the
+# top of the admissible range instead. Measured against each benchmark's gradient oracle;
+# see scripts/verify_bounds.py. Benchmarks absent here fall back to the asymptotic rule.
 MEASURED_AUXILIARY_ETA = {
     "distribution": 0.98,
     "lq": 0.95,
@@ -198,6 +187,19 @@ def job(
     }
 
 
+def gaussian_jobs(env):
+    """Gaussian-manifold transport arm, on the same lambda grid as the transport arm.
+
+    The estimator carries no auxiliary radius, so eta is absent here: the flow
+    sensitivity is a likelihood ratio rather than a centered policy difference.
+    The block sizes are the transport allocation unchanged, which keeps the two
+    continuous arms at the same T(M + n + B) simulator cost per update and
+    isolates the estimator as the only difference between them.
+    """
+    return [job(env, "gaussian", TRANSPORT_ALLOCATIONS[env]["horizon"], flow="particle", perturbation=lambda_)
+            for lambda_ in bound_lambda_grid(env)]
+
+
 def continuous_transport_jobs(env, components=None):
     """Continuous transport arm: bound-scale lambda multipliers times mixture sizes."""
     components = CONTINUOUS_COMPONENTS[env] if components is None else components
@@ -241,11 +243,8 @@ def experiment_plan(env):
         jobs.extend(transport_job(env, lambda_=lambda_) for lambda_ in bound_lambda_grid(env))
         return jobs
 
-    if env == "lq":
-        return [job(env, "reinforce", horizon)] + continuous_transport_jobs(env)
-
-    if env == "portfolio":
-        return [job(env, "reinforce", horizon)] + continuous_transport_jobs(env)
+    if env in CONTINUOUS_ENVS:
+        return [job(env, "reinforce", horizon)] + continuous_transport_jobs(env) + gaussian_jobs(env)
 
     raise ValueError(f"Unknown environment: {env}")
 
@@ -305,6 +304,10 @@ def fair_run_parameters(job_spec):
                 if env in CONTINUOUS_REFERENCE
                 else max(1, round(base_cost / horizon))
             )
+    elif algorithm == "gaussian" and allocation is not None:
+        parameters["n_particles"] = allocation["B"]
+        parameters["n_flow_particles"] = allocation["M"]
+        parameters["n_law_gradient"] = allocation["n"]
     elif algorithm == "transport" and allocation is not None:
         parameters["n_particles"] = allocation["B"]
         if env in DISCRETE_ENVS:
@@ -317,7 +320,7 @@ def fair_run_parameters(job_spec):
 
     if (
         job_spec["flow"] == "particle"
-        and algorithm in {"mfreinforce", "transport"}
+        and algorithm in {"mfreinforce", "transport", "gaussian"}
         and "n_flow_particles" not in parameters
     ):
         parameters["n_flow_particles"] = ref_particles
