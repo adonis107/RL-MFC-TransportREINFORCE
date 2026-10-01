@@ -75,6 +75,9 @@ def final_policy_probabilities(env, policy, law=None, t=0):
 def flow_dataframe(run):
     metadata = run["metadata"]
     flow = learned_flow(run)
+    if metadata["env"] == "bimodal":
+        # The particle flow of the population argument, the kernel mass near zero.
+        return pd.DataFrame({"time": range(flow.shape[0]), "kernel_mass": flow.numpy()})
     if metadata["env"] in {"lq", "portfolio"}:
         return pd.DataFrame(
             {

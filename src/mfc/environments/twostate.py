@@ -8,13 +8,14 @@ class TwoStateConfig:
     lambda1: float = 0.8
     kappa: float = 10.0
     p: float = 0.6
-    T: int = 2
+    T: int = 5
     gamma: float = 1.0 # No discount
     n_train: int = 10_000
     lr: float = 1e-3
     n_particles: int = 200
     n_logit_gradient: int = 10
     validation_interval: int = 10
+    validation_particles: int = 100_000
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 class TwoState:

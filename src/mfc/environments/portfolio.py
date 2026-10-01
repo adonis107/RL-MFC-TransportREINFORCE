@@ -24,11 +24,16 @@ class PortfolioConfig:
     lr: float = 1e-2
     n_particles: int = 500
     validation_interval: int = 10
+    validation_particles: int = 100_000
     dtype: torch.dtype = torch.float64
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 class Portfolio:
+    # The policy parameter may carry a trailing particle dimension, read elementwise:
+    # the transport estimator simulates its shifted systems side by side this way.
+    per_particle_parameters = True
+
     def __init__(self, config=PortfolioConfig()):
         self.config = config
         self.dtype = config.dtype

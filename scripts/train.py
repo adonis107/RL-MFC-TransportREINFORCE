@@ -26,6 +26,8 @@ from mfc.algorithms import (
 from mfc.environments import (
     Advertising,
     AdvertisingConfig,
+    Bimodal,
+    BimodalConfig,
     Cybersecurity,
     CybersecurityConfig,
     Distribution,
@@ -46,10 +48,11 @@ ENVIRONMENTS = {
     "advertising": (Advertising, AdvertisingConfig),
     "lq": (LQ, LQConfig),
     "portfolio": (Portfolio, PortfolioConfig),
+    "bimodal": (Bimodal, BimodalConfig),
 }
 
 DISCRETE_ENVS = {"twostate", "cybersecurity", "distribution", "advertising"}
-CONTINUOUS_ENVS = {"lq", "portfolio"}
+CONTINUOUS_ENVS = {"lq", "portfolio", "bimodal"}
 TRANSPORT_ALGORITHMS = {"transport"}
 # Transport on the Gaussian manifold with a likelihood-ratio flow sensitivity: no
 # auxiliary radius, so it is not part of the eta-carrying family above.
@@ -167,6 +170,7 @@ def build_environment(args):
         "lr": args.lr,
         "n_particles": args.n_particles,
         "validation_interval": args.validation_interval,
+        "validation_particles": args.validation_particles,
     }
 
     if args.env in {"advertising", "distribution"}:
@@ -223,6 +227,9 @@ def build_algorithm(args, env):
     if args.algorithm == "gaussian":
         if args.env not in CONTINUOUS_ENVS:
             raise ValueError("Gaussian-manifold transport is only configured for continuous-state environments.")
+        if args.env == "bimodal":
+            # This arm hands the environment the population mean, which the bimodal reward does not read.
+            raise ValueError("Gaussian-manifold transport does not apply to the bimodal benchmark.")
         if args.perturbation is None:
             raise ValueError("Gaussian transport requires --perturbation lambda.")
         config = GaussianTransportConfig(
@@ -360,6 +367,9 @@ def history_time_sum(history, key):
 
 
 def run_training(args):
+    # Argument validation of torch.distributions re-checks constraints on every draw;
+    # the policies here are valid by construction.
+    torch.distributions.Distribution.set_default_validate_args(False)
     torch.manual_seed(args.seed)
     env = build_environment(args)
     algorithm = build_algorithm(args, env)
@@ -463,6 +473,7 @@ def parse_args():
     parser.add_argument("--n-law-particles", type=int, default=None)
     parser.add_argument("--n-flow-particles", type=int, default=None)
     parser.add_argument("--validation-interval", type=int, default=None)
+    parser.add_argument("--validation-particles", type=int, default=None)
     parser.add_argument("--simplex-sigma", type=float, default=1.0)
     parser.add_argument("--simplex-resolution", type=int, default=30)
     parser.add_argument("--q-learning-lr-power", type=float, default=0.6)

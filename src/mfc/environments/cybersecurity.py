@@ -26,6 +26,7 @@ class CybersecurityConfig:
     n_particles: int = 200
     n_logit_gradient: int = 1
     validation_interval: int = 10
+    validation_particles: int = 100_000
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     @property
@@ -93,6 +94,11 @@ class Cybersecurity:
 
     def transition(self, states, mu, actions):
         actions = torch.broadcast_to(actions, states.shape)
+        if mu.ndim == 1 and states.ndim > 0:
+            # One population argument shared by every particle: one kernel per action covers them all.
+            all_actions = torch.arange(self.n_actions, device=states.device)
+            kernels = torch.matrix_exp(self.config.dt * self._generator_matrix(mu, all_actions))
+            return kernels[actions, states]
 
         probabilities = torch.matrix_exp(self.config.dt * self._generator_matrix(mu, actions))
         if states.ndim == 0:

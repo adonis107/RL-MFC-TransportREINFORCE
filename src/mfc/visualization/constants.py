@@ -2,6 +2,8 @@ from mfc.environments import (
     Advertising,
     AdvertisingConfig,
     AdvertisingPolicy,
+    Bimodal,
+    BimodalConfig,
     Cybersecurity,
     CybersecurityConfig,
     CybersecurityPolicy,
@@ -19,6 +21,7 @@ from mfc.environments import (
 
 ENVIRONMENTS = {
     "advertising": (Advertising, AdvertisingConfig),
+    "bimodal": (Bimodal, BimodalConfig),
     "cybersecurity": (Cybersecurity, CybersecurityConfig),
     "distribution": (Distribution, DistributionConfig),
     "lq": (LQ, LQConfig),

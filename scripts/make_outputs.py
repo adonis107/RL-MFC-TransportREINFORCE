@@ -30,12 +30,15 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import run as run_plan
 import verify_bounds
 from mfc.algorithms.discrete_validation import mean_field_next_law
+from mfc.algorithms.validation import monte_carlo_objective
 from mfc.environments import (
     LQ,
     LQConfig,
     Advertising,
     AdvertisingConfig,
     AdvertisingPolicy,
+    Bimodal,
+    BimodalConfig,
     Cybersecurity,
     CybersecurityConfig,
     CybersecurityPolicy,
@@ -48,13 +51,15 @@ from mfc.environments import (
     TwoStateConfig,
 )
 from mfc.visualization import load_runs, objective_table, runtime_table
+from mfc.visualization.constants import ENVIRONMENTS as ENVIRONMENT_CLASSES
+from mfc.visualization.io import dataclass_from_dict
 
 
-BENCHMARKS = ["twostate", "cybersecurity", "distribution", "advertising", "lq", "portfolio"]
+BENCHMARKS = ["twostate", "cybersecurity", "distribution", "advertising", "lq", "portfolio", "bimodal"]
 # Continuous-state benchmarks carry the mixture chart and the Gaussian-manifold
 # arm; the other groups name the figure each set of benchmarks appears on.
 CONTINUOUS_ENVS = ["lq", "portfolio"]
-MAIN_ENVS = ["distribution", "portfolio"]
+MAIN_ENVS = ["distribution", "portfolio", "bimodal"]
 APPENDIX_MAIN_ENVS = ["lq", "twostate"]
 APPENDIX_ENVS = ["cybersecurity", "advertising"]
 DISPLAY = {
@@ -64,29 +69,37 @@ DISPLAY = {
     "advertising": "Advertising",
     "lq": "Linear--quadratic",
     "portfolio": "Portfolio",
+    "bimodal": "Bimodal allocation",
 }
+# Mixture size of the transport run reported for each continuous benchmark. The
+# bimodal benchmark is reported with two components, the size it is built to need;
+# its single-Gaussian arm is drawn beside it as "Transport, K=1".
+TRANSPORT_COMPONENTS = {"lq": 1, "portfolio": 1, "bimodal": 2}
 MAIN_FLOW = {
-    "twostate": "exact",
-    "cybersecurity": "exact",
-    "distribution": "exact",
-    "advertising": "exact",
+    "twostate": "particle",
+    "cybersecurity": "particle",
+    "distribution": "particle",
+    "advertising": "particle",
     "lq": "particle",
     "portfolio": "particle",
+    "bimodal": "particle",
 }
 REFERENCE_OPTIMUM = {
     ("twostate", 5): -2.640,
     ("distribution", 5): -0.056991,
-    ("advertising", 5): 1.006168,
+    ("advertising", 5): 1.018750,
 }
 LEARNING_PANELS = {
     "Linear--quadratic": ("lq", -7.223777),
     "Portfolio": ("portfolio", -13.153766),
     "Two-state": ("twostate", -2.640),
     "Distribution": ("distribution", -0.056991),
+    "Bimodal allocation": ("bimodal", 0.0),
 }
 METHOD_COLOR = {"REINFORCE": "#eb6834", "MF-REINFORCE": "#eda100", "Transport": "#2a78d6",
-                "Transport-Proba": "#7b3fbf"}
-METHOD_MARKER = {"REINFORCE": "s", "MF-REINFORCE": "D", "Transport": "o", "Transport-Proba": "^"}
+                "Transport-Proba": "#7b3fbf", "Transport, K=1": "#8fb8e8"}
+METHOD_MARKER = {"REINFORCE": "s", "MF-REINFORCE": "D", "Transport": "o", "Transport-Proba": "^",
+                 "Transport, K=1": "v"}
 OPTIMAL = "#52514e"
 MFQ_COLOR = "#1baf7a"
 TRADEOFF_COLOR = {"lq": "#2a78d6", "portfolio": "#eb6834", "twostate": "#1baf7a", "distribution": "#eda100"}
@@ -154,6 +167,9 @@ def transport_stem(results_root, env, flow=None, components=None):
         stem = re.sub(r"_seed_\d+$", "", path.name)
         if components is not None and f"_K_{components}_" not in stem:
             continue
+        # The radius is selected before training, so only the lambda grid is read off the runs.
+        if f"_eta_{run_plan.auxiliary_eta(env):g}_" not in stem:
+            continue
         value = json.loads(summary.read_text()).get("last_validation_objective")
         if value is not None:
             scores.setdefault(stem, []).append(value)
@@ -204,22 +220,75 @@ def run_stems(results_root, env, include_gaussian=False):
     horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
     stems = {"REINFORCE": f"reinforce_none_T_{horizon}_exact"}
     if env == "twostate":
-        stems["MF-REINFORCE"] = f"mfreinforce_eps_0.2_T_{horizon}_exact"
+        stems["MF-REINFORCE"] = f"mfreinforce_eps_0.2_T_{horizon}_particle"
     elif env == "cybersecurity":
-        stems["MF-REINFORCE"] = f"mfreinforce_eps_1_T_{horizon}_exact"
+        stems["MF-REINFORCE"] = f"mfreinforce_eps_1_T_{horizon}_particle"
     elif env == "distribution":
-        stems["MF-REINFORCE"] = f"mfreinforce_eps_2_T_{horizon}_exact"
+        stems["MF-REINFORCE"] = f"mfreinforce_eps_2_T_{horizon}_particle"
     elif env == "advertising":
-        stems["MF-REINFORCE"] = f"mfreinforce_eps_1_T_{horizon}_exact"
-    components = 1 if env in CONTINUOUS_ENVS else None
-    stem = transport_stem(results_root, env, components=components)
+        stems["MF-REINFORCE"] = f"mfreinforce_eps_1_T_{horizon}_particle"
+    stem = transport_stem(results_root, env, components=TRANSPORT_COMPONENTS.get(env))
     if stem is not None:
         stems["Transport"] = stem
+    if env == "bimodal":
+        stem = transport_stem(results_root, env, components=1)
+        if stem is not None:
+            stems["Transport, K=1"] = stem
     if include_gaussian:
         stem = gaussian_stem(results_root, env)
         if stem is not None:
             stems["Transport-Proba"] = stem
     return stems
+
+
+_OPTIMAL_POLICIES = {}
+_RUN_OPTIMA = {}
+
+
+def optimal_policy_of(name, env):
+    """The benchmark's optimal policy, or None where it has no reference (cybersecurity)."""
+    key = (name, env.config.T, getattr(env.config, "T_val", None))
+    if key not in _OPTIMAL_POLICIES:
+        if name == "cybersecurity":
+            policy = None
+        elif name in {"distribution", "advertising"}:
+            policy = env.optimal_policy()
+        else:
+            policy = env.optimal_theta()
+        _OPTIMAL_POLICIES[key] = policy
+    return _OPTIMAL_POLICIES[key]
+
+
+def run_optimum(path):
+    """J(theta*) estimated as this run's validation estimates J(theta).
+
+    The optimal policy is evaluated with the run's own validation particles and
+    seed, so the finite-particle offset of the estimator, which does not vanish at
+    the optimum for a reward with a kink, cancels in the gap. None for runs
+    validated before Monte Carlo validation, or without a known optimum.
+    """
+    path = Path(path)
+    if path not in _RUN_OPTIMA:
+        metadata = json.loads((path / "metadata.json").read_text())
+        value = None
+        if "validation_particles" in metadata["env_config"]:
+            env_class, config_class = ENVIRONMENT_CLASSES[metadata["env"]]
+            env = env_class(dataclass_from_dict(config_class, metadata["env_config"], device="cpu"))
+            policy = optimal_policy_of(metadata["env"], env)
+            if policy is not None:
+                n_train = metadata["algorithm_config"].get("n_train") or metadata["env_config"]["n_train"]
+                value = float(monte_carlo_objective(
+                    env, policy, lambda t: t, metadata["resolved_discount"], env.config.validation_particles,
+                    getattr(env.config, "T_val", env.config.T), metadata["seed"] + n_train,
+                ))
+        _RUN_OPTIMA[path] = value
+    return _RUN_OPTIMA[path]
+
+
+def seed_optima(directory, stem, fallback):
+    """Per-seed reference optima, in the order curves() stacks the seeds."""
+    optima = [run_optimum(path) for path in sorted(Path(directory).glob(f"{stem}_seed_*"))]
+    return np.array([fallback if value is None else value for value in optima])
 
 
 def curves(directory, stem):
@@ -260,7 +329,7 @@ def style(ax):
 
 
 def scale_label(results_root, env, include_gaussian=False):
-    lambda_, eta = transport_scales(transport_stem(results_root, env))
+    lambda_, eta = transport_scales(transport_stem(results_root, env, components=TRANSPORT_COMPONENTS.get(env)))
     parts = [] if lambda_ is None or eta is None else [rf"$\lambda={lambda_:.3g},\ \eta={eta:g}$"]
     if include_gaussian:
         proba, _ = transport_scales(gaussian_stem(results_root, env))
@@ -282,7 +351,7 @@ def draw_learning_panel(ax, results_root, env, legend_only=False, include_gaussi
         if seeds is None:
             continue
         steps = np.arange(1, seeds.shape[1] + 1) * 10
-        gaps = np.abs(seeds - optimum)
+        gaps = np.abs(seeds - seed_optima(env_dir(results_root, env), stem, optimum)[:, None])
         gap, deviation = gaps.mean(axis=0), gaps.std(axis=0)
         panel.extend(gap.tolist())
         ax.plot(steps, gap, color=METHOD_COLOR[method], linewidth=1.1, label=method)
@@ -315,7 +384,7 @@ def figure_legend(figure, axes, order, ncol):
                   ncol=ncol, frameon=False, handlelength=1.8)
 
 
-FLOW_ORDER = (r"$\theta^\star$", "Transport", "MF-REINFORCE", "REINFORCE")
+FLOW_ORDER = (r"$\theta^\star$", "Transport", "Transport, K=1", "MF-REINFORCE", "REINFORCE")
 # Only the continuous appendix figure carries the Gaussian-manifold arm.
 PROBA_ORDER = (r"$\theta^\star$", "Transport", "Transport-Proba", "REINFORCE")
 
@@ -392,7 +461,7 @@ def draw_twostate_flow(ax, results_root, include_gaussian=False):
     run_dir = env_dir(results_root, "twostate")
     runs = {
         "Transport": run_dir / f"{transport_stem(results_root, 'twostate')}_seed_0",
-        "MF-REINFORCE": run_dir / "mfreinforce_eps_0.2_T_5_exact_seed_0",
+        "MF-REINFORCE": run_dir / "mfreinforce_eps_0.2_T_5_particle_seed_0",
         "REINFORCE": run_dir / "reinforce_none_T_5_exact_seed_0",
     }
     steps = np.arange(env.config.T + 1)
@@ -429,7 +498,7 @@ def draw_distribution_flow(ax, results_root, include_gaussian=False):
     run_dir = env_dir(results_root, "distribution")
     for method, stem in {
         "Transport": transport_stem(results_root, "distribution"),
-        "MF-REINFORCE": "mfreinforce_eps_2_T_5_exact",
+        "MF-REINFORCE": "mfreinforce_eps_2_T_5_particle",
         "REINFORCE": "reinforce_none_T_5_exact",
     }.items():
         folder = run_dir / f"{stem}_seed_0"
@@ -447,31 +516,54 @@ def draw_distribution_flow(ax, results_root, include_gaussian=False):
     style(ax)
 
 
+def draw_bimodal_flow(ax, results_root, include_gaussian=False):
+    """Terminal law mu_1^theta of the final policies, against the optimum and its K=1 fit."""
+    env = Bimodal(BimodalConfig(device="cpu"))
+    points = torch.linspace(-3.0, 3.0, 301, dtype=env.dtype)
+    density = lambda theta: env.terminal_density(theta.reshape(1).to(env.dtype), points).numpy()
+    ax.plot(points.numpy(), density(env.optimal_theta()), color=OPTIMAL, linewidth=1.0,
+            dashes=(3, 2), label=r"$\theta^\star$")
+    # Every terminal law has mean zero and variance one, so this is the K=1 fit of all of them.
+    ax.plot(points.numpy(), np.exp(-0.5 * points.numpy() ** 2) / np.sqrt(2.0 * np.pi), color=MUTED,
+            linewidth=0.8, dashes=(1, 1.6), label=r"$\mathcal{N}(0,1)$")
+    directory = env_dir(results_root, "bimodal")
+    for method, stem in run_stems(results_root, "bimodal").items():
+        folder = directory / f"{stem}_seed_0"
+        if not (folder / "policy.pt").exists():
+            continue
+        ax.plot(points.numpy(), density(tensor_policy(folder)), color=METHOD_COLOR[method],
+                linewidth=1.1, label=method)
+    ax.set_title("Bimodal allocation: terminal law", fontsize=8, color=INK, pad=3)
+    ax.set_xlabel("$x$", fontsize=7.5)
+    ax.set_ylabel(r"$\mu_1^\theta(x)$", fontsize=7.5)
+    style(ax)
+
+
 FLOW_PANEL = {
     "lq": draw_lq_flow,
     "portfolio": draw_portfolio_flow,
     "twostate": draw_twostate_flow,
     "distribution": draw_distribution_flow,
+    "bimodal": draw_bimodal_flow,
 }
 
 
 def main_benchmarks(results_root, output):
-    """Main-text panel: one horizontal row, two panels per benchmark."""
+    """Main-text figure: optimality gaps on the top row, induced populations below."""
     envs = [env for env in MAIN_ENVS if has_run(results_root, env)]
     if not envs:
         print("skipping main_benchmarks: no matching runs found")
         return
-    figure, axes = plt.subplots(1, 2 * len(envs), figsize=(5.5, 1.8), constrained_layout=True)
-    axes = np.atleast_1d(axes).ravel()
+    figure, axes = plt.subplots(2, len(envs), figsize=(5.5, 3.4), constrained_layout=True, squeeze=False)
     for index, env in enumerate(envs):
-        draw_learning_panel(axes[2 * index], results_root, env)
-        FLOW_PANEL[env](axes[2 * index + 1], results_root)
-    # Four panels across the text width leave no room for the default tick density.
-    titles = [f"{TITLE_OF[env].replace('--', '-')}: {suffix}"
-              for env in envs for suffix in ("optimality gap", None)]
+        draw_learning_panel(axes[0, index], results_root, env)
+        FLOW_PANEL[env](axes[1, index], results_root)
+    axes = axes.ravel()
+    # Three panels across the text width leave no room for the default tick density.
+    titles = [f"{TITLE_OF[env].replace('--', '-')}: optimality gap" for env in envs] + [None] * len(envs)
     for ax, title in zip(axes, titles):
         ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=3, steps=[1, 2, 5, 10]))
-        if title.endswith("None"):
+        if title is None:
             title = ax.get_title()
         ax.set_title(title, fontsize=6.8, color=INK, pad=ax.title.get_position()[1] * 0 + 12)
         ax.tick_params(labelsize=6.0)
@@ -649,11 +741,12 @@ def appendix_benchmarks(results_root, output):
     save_figure(figure, output)
 
 
-# Sweeps run at an auxiliary radius other than the headline one, selected by name.
-TRADEOFF_FILTER = {"twostate": "eta_0.85", "distribution": "eta_0.85"}
+def tradeoff_filter(env):
+    """The lambda sweep is read at the benchmark's selected auxiliary radius."""
+    return f"_eta_{run_plan.auxiliary_eta(env):g}_"
 
 
-def lambda_sweep(results_root, env, filter_text, flow, horizon):
+def lambda_sweep(results_root, env, filter_text, flow, horizon, optimum):
     """Optimality gap of every transport lambda available for this benchmark."""
     directory = env_dir(results_root, env)
     points = {}
@@ -667,8 +760,9 @@ def lambda_sweep(results_root, env, filter_text, flow, horizon):
         if not summary.exists():
             continue
         lambda_ = float(re.search(r"lambda_([0-9.]+)", stem).group(1))
-        points.setdefault(lambda_, []).append(
-            json.loads(summary.read_text())["last_validation_objective"])
+        reference = run_optimum(path)
+        value = json.loads(summary.read_text())["last_validation_objective"]
+        points.setdefault(lambda_, []).append(abs(value - (optimum if reference is None else reference)))
     return points
 
 
@@ -676,13 +770,15 @@ def lambda_tradeoff(results_root, output):
     figure, ax = plt.subplots(figsize=(3.6, 2.5), constrained_layout=True)
     drawn = 0
     for title, (env, optimum) in LEARNING_PANELS.items():
+        if env not in TRADEOFF_COLOR:
+            continue
         horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
-        points = lambda_sweep(results_root, env, TRADEOFF_FILTER.get(env), MAIN_FLOW[env], horizon)
+        points = lambda_sweep(results_root, env, tradeoff_filter(env), MAIN_FLOW[env], horizon, optimum)
         if len(points) < 2:
             print(f"skipping {env} in lambda_tradeoff: fewer than two scales available")
             continue
         scales = sorted(points)
-        gaps = [abs(sum(points[s]) / len(points[s]) - optimum) for s in scales]
+        gaps = [sum(points[s]) / len(points[s]) for s in scales]
         best = min(gaps)
         colour = TRADEOFF_COLOR[env]
         ax.plot(scales, [g / best for g in gaps], color=colour, marker=TRADEOFF_MARKER[env],
@@ -706,6 +802,130 @@ def lambda_tradeoff(results_root, output):
     ax.set_ylim(0.75, ax.get_ylim()[1] * 2.2)
     ax.legend(frameon=False, fontsize=6.6, handlelength=1.6, loc="upper left", ncol=2,
               columnspacing=1.0, borderaxespad=0.2)
+    save_figure(figure, output)
+
+
+ETA_ENVS = ("twostate", "cybersecurity", "distribution", "advertising")
+ETA_COLOR = dict(zip(ETA_ENVS, ["#1baf7a", "#e87ba4", "#eda100", "#008300"]))
+ETA_MARKER = dict(zip(ETA_ENVS, ["^", "v", "D", "s"]))
+
+
+def discrete_eta(eta_csv, output):
+    """Auxiliary-radius diagnostic: estimator error against the exact oracles, per benchmark."""
+    if not Path(eta_csv).exists():
+        print("skipping discrete_eta: diagnostic CSV not found")
+        return
+    table = pd.read_csv(eta_csv)
+    figure, axes = plt.subplots(1, 2, figsize=(5.5, 2.2), constrained_layout=True)
+    panels = [("d_mse", r"$\sum_t\mathbb{E}\|\widehat D_t-D_t\|_F^2/\sum_t\|D_t\|_F^2$", "sensitivity"),
+              ("g_mse", r"$\mathbb{E}\|\widehat G-\nabla J\|^2/\|\nabla J\|^2$", "gradient")]
+    for ax, (column, ylabel, title) in zip(axes, panels):
+        for env in [env for env in ETA_ENVS if (table["env"] == env).any()]:
+            for batches, dashes in (("reused", None), ("fresh", (3, 2))):
+                rows = table[(table["env"] == env) & (table["batches"] == batches)].dropna(subset=[column])
+                if rows.empty:
+                    continue
+                rows = rows.sort_values("eta")
+                style_kwargs = {} if dashes is None else {"dashes": dashes, "alpha": 0.7}
+                ax.plot(rows["eta"], rows[column], color=ETA_COLOR[env], marker=ETA_MARKER[env], markersize=3.0,
+                        linewidth=1.0, label=DISPLAY[env] if batches == "reused" else None, **style_kwargs)
+        ax.axvspan(0.85, 0.98, color=GRID, alpha=0.5, linewidth=0)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel(r"$\eta$")
+        ax.set_ylabel(ylabel, fontsize=6.8)
+        ax.set_title(title, fontsize=8, color=INK)
+        ticks = [0.15, 0.3, 0.5, 0.95]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f"{t:g}" for t in ticks])
+        ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+        style(ax)
+    figure_legend(figure, axes, [DISPLAY[env] for env in ETA_ENVS], 4)
+    save_figure(figure, output)
+
+
+def scientific(value):
+    if value >= 1e3:
+        mantissa, exponent = f"{value:.2e}".split("e")
+        return f"${float(mantissa):.2f}\\cdot10^{{{int(exponent)}}}$"
+    return f"${value:.3g}$"
+
+
+def discrete_eta_table(eta_csv):
+    """Auxiliary-radius diagnostic as a table: shared against fresh batches, and the gradient error."""
+    if not Path(eta_csv).exists():
+        return None
+    table = pd.read_csv(eta_csv)
+    lines = [
+        "Benchmark & $n$ & $\\eta$ & \\multicolumn{2}{c}{Sensitivity error} & Gradient error \\\\",
+        " & & & shared batch & fresh batches & shared batch \\\\",
+        "\\midrule",
+    ]
+    envs = [env for env in ETA_ENVS if (table["env"] == env).any()]
+    for env in envs:
+        rows = table[table["env"] == env]
+        for index, eta in enumerate(sorted(rows["eta"].unique())):
+            reused = rows[(rows["eta"] == eta) & (rows["batches"] == "reused")].iloc[0]
+            fresh = rows[(rows["eta"] == eta) & (rows["batches"] == "fresh")]
+            lines.append(" & ".join([
+                DISPLAY[env] if index == 0 else "",
+                str(int(reused["n"])) if index == 0 else "",
+                f"${eta:.3g}$",
+                scientific(reused["d_mse"]),
+                "---" if fresh.empty else scientific(fresh.iloc[0]["d_mse"]),
+                scientific(reused["g_mse"]),
+            ]) + " \\\\")
+        if env != envs[-1]:
+            lines.append("\\midrule")
+    caption = (
+        "Auxiliary radius on the finite benchmarks, at the initial policy and $\\lambda=B^{-1/4}$: relative "
+        "mean-square errors $\\sum_t\\E\\|\\widehat D_t-D_t\\|_F^2/\\sum_t\\|D_t\\|_F^2$ and "
+        "$\\E\\|\\widehat G-\\nabla_\\theta J\\|^2/\\|\\nabla_\\theta J\\|^2$ against the exact sensitivities "
+        "and gradient, over 100 and 50 replications. The first rows of each benchmark are "
+        "$\\eta_\\star/2$, $\\eta_\\star$ and $2\\eta_\\star$ when below one, with $\\eta_\\star=n^{-1/4}$."
+    )
+    return table_environment("\n".join(lines), caption, "tab:discrete-eta", "lrrrrr", size="\\small")
+
+
+def twostate_eta_sweep(results_root, output):
+    """Two-state optimality gap at lambda* across the bound radii and the large grid."""
+    env = "twostate"
+    if not has_run(results_root, env):
+        print("skipping twostate_eta_sweep: no matching runs found")
+        return
+    horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
+    lambda_ = run_plan.asymptotic_main_lambda(env)
+    figure, ax = plt.subplots(figsize=(3.2, 2.2), constrained_layout=True)
+    drawn = False
+    for flow, marker in (("exact", "o"), ("particle", "s")):
+        points = []
+        for eta in run_plan.bound_eta_grid(env) + run_plan.LARGE_AUXILIARY_ETAS:
+            gaps = seed_gaps(results_root, env, f"transport_lambda_{lambda_:g}_eta_{eta:g}_T_{horizon}_{flow}")
+            if gaps.size:
+                points.append((eta, gaps.mean(), gaps.std(ddof=1) if gaps.size > 1 else 0.0))
+        if len(points) < 2:
+            continue
+        etas, means, deviations = map(np.array, zip(*points))
+        ax.errorbar(etas, means, yerr=deviations, color=METHOD_COLOR["Transport"], marker=marker, markersize=3.4,
+                    linewidth=1.0, capsize=2, dashes=(3, 2) if flow == "particle" else (None, None),
+                    label=f"{flow} flow")
+        drawn = True
+    if not drawn:
+        print("skipping twostate_eta_sweep: fewer than two radii available")
+        plt.close(figure)
+        return
+    ax.axvspan(0.85, 0.98, color=GRID, alpha=0.5, linewidth=0)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"$\eta$")
+    ax.set_ylabel(r"$|J(\widehat\theta)-J(\theta^\star)|$")
+    ax.set_title(rf"Two-state: auxiliary radius at $\lambda={lambda_:.3g}$", fontsize=8, color=INK)
+    ticks = [0.25, 0.5, 0.95]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([f"{t:g}" for t in ticks])
+    ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    style(ax)
+    ax.legend(frameon=False, fontsize=6.6)
     save_figure(figure, output)
 
 
@@ -975,7 +1195,9 @@ def select_headline(grouped, env):
     subset = subset[(subset["flow"] == flow) | (subset["method"] == "reinforce")]
     best = {}
     for method, rows in subset.groupby("method"):
-        best[method] = rows.loc[rows["mean"].idxmax()]
+        rows = rows.dropna(subset=["mean"])
+        if not rows.empty:
+            best[method] = rows.loc[rows["mean"].idxmax()]
     return best
 
 
@@ -1007,7 +1229,7 @@ def objective_summary(results_root):
         transport = best.get("transport")
         # Read off the run being reported rather than recomputing the grid rule, which
         # need not name a configuration this results tree actually contains.
-        components = 1 if env in CONTINUOUS_ENVS else None
+        components = TRANSPORT_COMPONENTS.get(env)
         lambda_, eta = transport_scales(transport_stem(results_root, env, components=components))
         scales = (
             "---"
@@ -1141,6 +1363,19 @@ def seed_values(results_root, env, stem):
     return np.array([value for value in values if value is not None])
 
 
+def seed_gaps(results_root, env, stem):
+    """Final optimality gap of every seed, each against its own reference optimum."""
+    gaps = []
+    for path in sorted(env_dir(results_root, env).glob(f"{stem}_seed_*")):
+        summary = path / "summary.json"
+        value = json.loads(summary.read_text()).get("last_validation_objective") if summary.exists() else None
+        if value is None:
+            continue
+        reference = run_optimum(path)
+        gaps.append(abs(value - (OPTIMUM_OF[env] if reference is None else reference)))
+    return np.array(gaps)
+
+
 def continuous_comparison(results_root):
     """Every scale of both continuous arms, against REINFORCE and the optimum."""
     lines = [
@@ -1151,7 +1386,6 @@ def continuous_comparison(results_root):
     available = [env for env in CONTINUOUS_ENVS if has_run(results_root, env)]
     for env in available:
         horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
-        optimum = OPTIMUM_OF[env]
         digits = 3 if env == "portfolio" else 4
         eta = transport_scales(transport_stem(results_root, env, components=1))[1]
         first = True
@@ -1168,7 +1402,7 @@ def continuous_comparison(results_root):
                 values = seed_values(results_root, env, stem)
                 if values.size == 0:
                     continue
-                gaps = np.abs(values - optimum)
+                gaps = seed_gaps(results_root, env, stem)
                 rows.append((scale, values.mean(), values.std(ddof=1), gaps.mean(), gaps.std(ddof=1)))
             if not rows:
                 continue
@@ -1200,6 +1434,52 @@ def continuous_comparison(results_root):
     return table_environment("\n".join(lines), caption, "tab:continuous-comparison", "llrrr", size="\\small")
 
 
+def bimodal_components(results_root):
+    """Bimodal allocation: every scale of the one- and two-component transport arms."""
+    if not has_run(results_root, "bimodal"):
+        return None
+    horizon = run_plan.TRANSPORT_ALLOCATIONS["bimodal"]["horizon"]
+    directory = env_dir(results_root, "bimodal")
+    lines = [
+        "Estimator & $K$ & $\\lambda$ & $|J(\\widehat\\theta)-J(\\theta^\\star)|$ & $\\widehat\\theta$ \\\\",
+        "\\midrule",
+    ]
+    configurations = [("REINFORCE", None, f"reinforce_none_T_{horizon}_exact")]
+    for components in run_plan.CONTINUOUS_COMPONENTS["bimodal"]:
+        stems = {
+            re.sub(r"_seed_\d+$", "", path.name)
+            for path in directory.glob(f"transport_*_K_{components}_T_{horizon}_particle_seed_*")
+        }
+        configurations.extend(
+            ("Transport", components, stem)
+            for stem in sorted(stems, key=lambda stem: transport_scales(stem)[0])
+        )
+    for name, components, stem in configurations:
+        values = seed_values(results_root, "bimodal", stem)
+        if values.size == 0:
+            continue
+        gaps = seed_gaps(results_root, "bimodal", stem)
+        thetas = np.array([float(tensor_policy(path).reshape(-1)[0])
+                           for path in sorted(directory.glob(f"{stem}_seed_*")) if (path / "policy.pt").exists()])
+        lambda_ = transport_scales(stem)[0]
+        lines.append(" & ".join([
+            name,
+            "---" if components is None else str(components),
+            "---" if lambda_ is None else f"${lambda_:g}$",
+            f"${gaps.mean():.4f}\\pm{gaps.std(ddof=1) if gaps.size > 1 else 0.0:.4f}$",
+            f"${thetas.mean():.4f}\\pm{thetas.std(ddof=1) if thetas.size > 1 else 0.0:.4f}$",
+        ]) + " \\\\")
+    env = Bimodal(BimodalConfig(device="cpu"))
+    caption = (
+        "Bimodal allocation: optimality gap and final parameter over seeds, from $\\theta=0.8$ "
+        f"(gap ${-float(env.objective(torch.tensor([0.8], dtype=env.dtype))):.4f}$). "
+        f"The optimum is $\\theta^\\star={float(env.optimal_theta()):.6f}$. With $K=1$ the "
+        f"projected objective is constant, $J_1={float(env.single_gaussian_objective()):.6f}$, "
+        "so the single-Gaussian arm carries no gradient."
+    )
+    return table_environment("\n".join(lines), caption, "tab:bimodal-components", "lrrrr", size="\\small")
+
+
 def headline_row(rows, results_root, env, algorithm):
     """The runtime row of the configuration the objective tables report.
 
@@ -1207,7 +1487,7 @@ def headline_row(rows, results_root, env, algorithm):
     be selected by the scale, not by whichever happened to run longest.
     """
     if algorithm == "transport":
-        components = 1 if env in CONTINUOUS_ENVS else None
+        components = TRANSPORT_COMPONENTS.get(env)
         lambda_, eta = transport_scales(transport_stem(results_root, env, components=components))
     elif algorithm == "gaussian":
         lambda_, eta = transport_scales(gaussian_stem(results_root, env))
@@ -1235,6 +1515,7 @@ def main():
     parser.add_argument("--theory-estimate", default="results/figures/theory/perturbation_estimate.csv")
     parser.add_argument("--theory-consistency", default="results/figures/theory_400/perturbation_consistency.csv")
     parser.add_argument("--bounds", default="results/figures/bounds/bounds.csv")
+    parser.add_argument("--discrete-eta", default="results/figures/discrete_eta/discrete_eta.csv")
     args = parser.parse_args()
 
     results_root = ROOT / args.results_root
@@ -1250,6 +1531,11 @@ def main():
     appendix_continuous(results_root, figures / "appendix_continuous.pdf")
     appendix_benchmarks(results_root, figures / "appendix_benchmarks.pdf")
     lambda_tradeoff(results_root, figures / "lambda_tradeoff.pdf")
+    discrete_eta(ROOT / args.discrete_eta, figures / "discrete_eta.pdf")
+    twostate_eta_sweep(results_root, figures / "twostate_eta_sweep.pdf")
+    eta_table = discrete_eta_table(ROOT / args.discrete_eta)
+    if eta_table is not None:
+        write_table(eta_table, tables / "discrete_eta.tex")
     theory_verification(ROOT / args.theory_estimate, ROOT / args.theory_consistency, figures / "theory_verification.pdf")
     write_table(objective_summary(results_root), tables / "objective_summary.tex")
     write_table(budget_runtime(results_root), tables / "budget_runtime.tex")
@@ -1260,6 +1546,9 @@ def main():
         write_table(exponents, tables / "bounds_exponents.tex")
     write_table(continuous_comparison(results_root), tables / "continuous_comparison.tex")
     write_table(continuous_runtime(results_root), tables / "continuous_runtime.tex")
+    bimodal = bimodal_components(results_root)
+    if bimodal is not None:
+        write_table(bimodal, tables / "bimodal_components.tex")
 
 
 if __name__ == "__main__":

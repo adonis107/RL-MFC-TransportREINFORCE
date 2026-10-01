@@ -11,12 +11,12 @@ class AdvertisingConfig:
     hidden_width: int = 32
     T: int = 5
     T_val: int = 5
-    validation_grid_size: int = 19
     n_train: int = 10_000
     lr: float = 1e-3
     n_particles: int = 200
     n_logit_gradient: int = 10
     validation_interval: int = 10
+    validation_particles: int = 100_000
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -54,21 +54,12 @@ class Advertising:
         self.dtype = torch.float32
         self.device = config.device
 
-        self.initial_distribution = torch.tensor([0.8, 0.2], dtype=self.dtype, device=self.device)
+        # Validation starts every run from p_0 = 0.5; training resamples p_0 instead.
+        self.initial_distribution = torch.tensor([0.5, 0.5], dtype=self.dtype, device=self.device)
 
     def sample_initial_distribution(self, generator):
         p = 0.05 + 0.9 * torch.rand((), dtype=self.dtype, device=self.device, generator=generator)
         return torch.stack([1.0 - p, p])
-
-    def validation_initial_distributions(self):
-        customer = torch.linspace(
-            0.05,
-            0.95,
-            self.config.validation_grid_size,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        return torch.stack([1.0 - customer, customer], dim=-1)
 
     def transition(self, states, mu, actions):
         prob_customer = (mu[..., self.CUSTOMER] + self.config.eta * actions).clamp(max=1.0)

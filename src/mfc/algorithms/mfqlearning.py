@@ -4,8 +4,8 @@ from itertools import product
 import torch
 from torch import nn
 
-from .discrete_validation import evaluate_initial_distributions
 from .timing import synchronized_time
+from .validation import monte_carlo_objective
 
 
 def integer_compositions(total, parts):
@@ -164,35 +164,43 @@ class MeanFieldQLearning:
                 reward = reward + law[state_index] * self.env.reward(state, law, action)
         return next_law / next_law.sum(), reward
 
-    def precompute_lifted_transitions(self):
-        next_indices = torch.empty(
-            (self.grid.shape[0], self.action_table.shape[0]),
-            dtype=torch.long,
-            device=self.env.device,
-        )
-        rewards = torch.empty_like(self.q)
-        for state_index, law in enumerate(self.grid):
-            for action_index, feedback_action in enumerate(self.action_table):
-                next_law, reward = self.lifted_step(law, feedback_action)
-                next_indices[state_index, action_index] = self.project(next_law)
-                rewards[state_index, action_index] = reward
-        return next_indices, rewards
+    def precompute_lifted_transitions(self, chunk=4096):
+        """Lifted step of every (grid law, feedback action) pair at once.
 
-    def validation_initial_distributions(self):
-        if hasattr(self.env, "validation_initial_distributions"):
-            return list(self.env.validation_initial_distributions())
-        return [self.env.initial_distribution]
+        The same quantities as lifted_step and project, for all pairs together:
+        the kernel and reward of every state under its feedback action, averaged
+        under the grid law, and the next law projected on the grid in chunks.
+        """
+        n_grid, n_feedback = self.q.shape
+        n_states = self.env.n_states
+        shape = (n_grid, n_feedback, n_states)
+        states = torch.arange(n_states, device=self.env.device).expand(shape)
+        actions = self.action_table.unsqueeze(0).expand(shape)
+        population = self.grid[:, None, None, :]
+        weights = self.grid.unsqueeze(1)
+        with torch.no_grad():
+            kernels = self.env.transition(states, population, actions)
+            rewards = (weights * self.env.reward(states, population, actions)).sum(dim=-1)
+            next_laws = (weights.unsqueeze(-1) * kernels).sum(dim=-2)
+            next_laws = (next_laws / next_laws.sum(dim=-1, keepdim=True)).reshape(-1, n_states)
+            next_indices = torch.cat([
+                (block.unsqueeze(1) - self.grid.unsqueeze(0)).square().sum(dim=-1).argmin(dim=-1)
+                for block in next_laws.split(chunk)
+            ])
+        return next_indices.reshape(n_grid, n_feedback), rewards.to(self.q.dtype)
 
-    def evaluate(self, policy=None, horizon=None):
+
+    def evaluate(self, policy=None, horizon=None, seed=None):
         policy = self.initial_policy() if policy is None else policy
         horizon = getattr(self.env.config, "T_val", self.horizon) if horizon is None else horizon
-        return evaluate_initial_distributions(
+        return monte_carlo_objective(
             self.env,
             policy,
-            lambda t: self.policy_time(t),
+            self.policy_time,
             self.discount,
-            self.validation_initial_distributions(),
+            self.env.config.validation_particles,
             horizon,
+            self.config.seed + self.n_train if seed is None else seed,
         )
 
     def sampled_pairs(self, generator):

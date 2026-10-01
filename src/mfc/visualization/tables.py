@@ -10,7 +10,9 @@ from .flows import final_policy_probabilities
 from .io import load_env_and_policy, run_label, runs_dataframe
 
 
-CONTINUOUS_TRANSPORT_ENVS = {"lq", "portfolio"}
+CONTINUOUS_TRANSPORT_ENVS = {"lq", "portfolio", "bimodal"}
+# Benchmarks whose perturbed objective J^lambda has no closed form under any randomizer.
+NO_PERTURBED_OBJECTIVE_ENVS = {"bimodal"}
 
 
 def optimize_exact_policy(env, lambda_, randomizer=None):
@@ -116,7 +118,7 @@ def objective_table(runs):
             # mixture chart with more than one component), and that is the only
             # case the perturbed columns are left out.
             law_randomizer = randomizer_for_run(metadata)
-            analytic_perturbation = (
+            analytic_perturbation = metadata["env"] not in NO_PERTURBED_OBJECTIVE_ENVS and (
                 metadata["env"] not in CONTINUOUS_TRANSPORT_ENVS or law_randomizer is not None
             )
             if metadata["env"] not in CONTINUOUS_TRANSPORT_ENVS:

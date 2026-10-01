@@ -5,3 +5,4 @@ from .twostate import TwoState, TwoStateConfig
 
 from .lq import LQ, LQConfig
 from .portfolio import Portfolio, PortfolioConfig
+from .bimodal import Bimodal, BimodalConfig

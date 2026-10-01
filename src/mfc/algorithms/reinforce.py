@@ -1,19 +1,13 @@
 from dataclasses import dataclass
 import importlib
-import inspect
 
 import torch
 from torch import nn
 
-from .discrete_validation import evaluate_initial_distributions, mean_field_next_law
+from .discrete_validation import mean_field_next_law
+from .sampling import sample_accepts_time
 from .timing import report_progress, synchronized_time
-
-
-def exact_continuous_validation_objective(env, policy):
-    value = env.objective(policy, lambda_=0.0)
-    if type(env).__name__ == "LQ":
-        return -value
-    return value
+from .validation import monte_carlo_objective
 
 
 @dataclass(frozen=True)
@@ -84,12 +78,6 @@ class Reinforce:
             return self.env.sample_initial_distribution(generator)
         return self.env.initial_distribution
 
-    def validation_initial_distributions(self):
-        if hasattr(self.env, "validation_initial_distributions"):
-            return list(self.env.validation_initial_distributions())
-        if hasattr(self.env, "initial_distribution"):
-            return [self.env.initial_distribution]
-        return [None]
 
     def initial_states(self, n_particles, generator, initial_distribution=None):
         if hasattr(self.env, "sample_initial"):
@@ -134,8 +122,7 @@ class Reinforce:
         return actions, log_probs
 
     def sample_next_states(self, t, states, law, actions, generator):
-        signature = inspect.signature(self.env.sample)
-        if "t" in signature.parameters:
+        if sample_accepts_time(self.env.sample):
             return self.env.sample(states, law, actions, generator, t=t)
         return self.env.sample(states, law, actions, generator)
 
@@ -185,29 +172,14 @@ class Reinforce:
     def mean_field_next_law(self, t, law):
         return mean_field_next_law(self.env, self.policy, self.policy_time, t, law)
 
-    def evaluate_discrete(self, horizon):
-        return evaluate_initial_distributions(
-            self.env,
-            self.policy,
-            self.policy_time,
-            self.discount,
-            self.validation_initial_distributions(),
-            horizon,
-        )
-
     def evaluate(self, n_particles=None, horizon=None, seed=None):
-        """Evaluate the policy.
-
-        Discrete environments and continuous environments with closed-form
-        objectives use exact deterministic validation. The n_particles and seed
-        arguments are kept for Monte Carlo fallback compatibility.
-        """
+        """Monte Carlo objective of the frozen policy with M_val interacting particles."""
         horizon = getattr(self.env.config, "T_val", self.horizon) if horizon is None else horizon
-        if hasattr(self.env, "n_states"):
-            return self.evaluate_discrete(horizon)
-        if hasattr(self.env, "objective"):
-            return exact_continuous_validation_objective(self.env, self.policy)
-        return self.rollout(n_particles=n_particles, horizon=horizon, seed=seed)["objective"]
+        n_particles = self.env.config.validation_particles if n_particles is None else n_particles
+        seed = self.config.seed if seed is None else seed
+        return monte_carlo_objective(
+            self.env, self.policy, self.policy_time, self.discount, n_particles, horizon, seed
+        )
 
     def loss(self, rollout):
         advantages = rollout["returns"].detach()
@@ -236,6 +208,8 @@ class Reinforce:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if hasattr(self.env, "project_policy"):
+                self.env.project_policy(self.policy)
             objective_value = float(rollout["objective"].detach().cpu())
             loss_value = float(loss.detach().cpu())
             history["train_step_seconds"].append(synchronized_time(self.env.device) - step_started_at)

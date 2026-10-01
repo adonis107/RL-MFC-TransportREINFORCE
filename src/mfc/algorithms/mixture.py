@@ -242,11 +242,12 @@ class GaussianMixture:
             # A single component has a closed-form fixed point: every responsibility is one,
             # so EM returns the sample mean and covariance after a single step. Running the
             # responsibility loop for it costs about a hundred times its own arithmetic, and
-            # the auxiliary block calls this once per shift per time step.
-            mean = samples.mean(dim=0, keepdim=True)
+            # the auxiliary block calls this once per shift per time step. Leading batch
+            # dimensions of the samples, (*batch, n, d), fit one law each.
+            mean = samples.mean(dim=-2, keepdim=True)
             centered = samples - mean
-            covariance = (centered.T @ centered / max(samples.shape[0], 1)).reshape(1, self.dim, self.dim)
-            weights = torch.ones(1, dtype=samples.dtype, device=samples.device)
+            covariance = (centered.transpose(-1, -2) @ centered / max(samples.shape[-2], 1)).unsqueeze(-3)
+            weights = torch.ones(samples.shape[:-2] + (1,), dtype=samples.dtype, device=samples.device)
             weights, mean, covariance = self.constrain(weights, mean, covariance)
             return self.encode(weights, mean, self.cholesky_factor(covariance))
 

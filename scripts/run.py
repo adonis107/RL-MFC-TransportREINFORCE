@@ -7,9 +7,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN = ROOT / "scripts" / "train.py"
 
-PRIMARY_ENVS = ["twostate", "cybersecurity", "distribution", "advertising", "lq", "portfolio"]
+PRIMARY_ENVS = ["twostate", "cybersecurity", "distribution", "advertising", "lq", "portfolio", "bimodal"]
 DISCRETE_ENVS = {"twostate", "cybersecurity", "distribution", "advertising"}
-CONTINUOUS_ENVS = {"lq", "portfolio"}
+CONTINUOUS_ENVS = {"lq", "portfolio", "bimodal"}
 
 DISCRETE_REFERENCE = {
     "twostate": {"n_particles": 200, "n_gradient": 10},
@@ -23,6 +23,9 @@ DISCRETE_REFERENCE = {
 # same matched budget as the published allocation they replace. Benchmarks absent here were screened
 # and carried too little gradient signal for the selection to mean anything, so they keep the
 # published allocation of the reference configuration.
+# Best scales of the MF-REINFORCE reference; advertising, absent there, was screened in {0.5, 1, 2}.
+MF_REINFORCE_EPSILON = {"twostate": 0.2, "cybersecurity": 1.0, "distribution": 2.0, "advertising": 1.0}
+
 MF_REINFORCE_SPLITS = {
     "twostate": {"n_particles": 20, "n_logit_gradient": 40},
     "distribution": {"n_particles": 260, "n_logit_gradient": 50},
@@ -31,19 +34,26 @@ MF_REINFORCE_SPLITS = {
 CONTINUOUS_REFERENCE = {
     "lq": {"n_particles": 200, "n_gradient": 1},
     "portfolio": {"n_particles": 500, "n_gradient": 1},
+    "bimodal": {"n_particles": 2000, "n_gradient": 1},
 }
 
+# The bimodal benchmark exists to compare mixture sizes: a single Gaussian sees
+# no dependence of the population on the policy, two components see all of it.
 CONTINUOUS_COMPONENTS = {
-    "lq": (1, 2),
+    "lq": (1,),
     "portfolio": (1,),
+    "bimodal": (1, 2),
 }
 
 # Transport allocation from the ICLR reference table. Here M is the population
-# block, n the auxiliary sensitivity block, and B the main trajectory block.
+# block, n the auxiliary sensitivity block, and B the main trajectory block. Every
+# headline run reads the population off M interacting particles, finite benchmarks
+# included; M is the particle count of the MF-REINFORCE reference, and every method of
+# a benchmark gets the same population block.
 TRANSPORT_ALLOCATIONS = {
     "twostate": {
         "horizon": 5,
-        "M": 0,
+        "M": 200,
         "n": 12,
         "B": 248,
         "updates": 10_000,
@@ -52,7 +62,7 @@ TRANSPORT_ALLOCATIONS = {
     },
     "cybersecurity": {
         "horizon": 3,
-        "M": 0,
+        "M": 200,
         "n": 51,
         "B": 153,
         "updates": 20_000,
@@ -61,7 +71,7 @@ TRANSPORT_ALLOCATIONS = {
     },
     "distribution": {
         "horizon": 5,
-        "M": 0,
+        "M": 500,
         "n": 280,
         "B": 280,
         "updates": 30_000,
@@ -70,7 +80,7 @@ TRANSPORT_ALLOCATIONS = {
     },
     "advertising": {
         "horizon": 5,
-        "M": 0,
+        "M": 200,
         "n": 65,
         "B": 195,
         "updates": 10_000,
@@ -95,6 +105,19 @@ TRANSPORT_ALLOCATIONS = {
         "lr": 1e-2,
         "d_theta": 20,
     },
+    # T = 1 makes a large main block cheap, and the bimodal objective needs one:
+    # its perturbed optimum drifts quickly with lambda (0.885, 0.898 and 0.923 at
+    # lambda = 0.025, 0.05 and 0.1, against theta* = 0.868), so B = 1e5 puts the
+    # bound grid at lambda* = B^(-1/4) = 0.056 and its halves and doubles.
+    "bimodal": {
+        "horizon": 1,
+        "M": 2000,
+        "n": 8000,
+        "B": 100_000,
+        "updates": 1_000,
+        "lr": 1e-3,
+        "d_theta": 1,
+    },
 }
 
 BOUND_LAMBDA_MULTIPLIERS = (0.5, 1.0, 2.0)
@@ -114,15 +137,25 @@ def effective_auxiliary_samples(env):
     return auxiliary
 
 
-# Auxiliary radius, measured rather than derived. Balancing the error bound gives
-# eta ~ n^(-1/4) in finite state space and n^(-1/6) in continuous state space, but the
-# constants it drops are lopsided by two orders of magnitude, so the minimiser sits at the
-# top of the admissible range instead. Measured against each benchmark's gradient oracle;
-# see scripts/verify_bounds.py. Benchmarks absent here fall back to the asymptotic rule.
+# Auxiliary radius, selected in LARGE_AUXILIARY_ETAS by the mean-square error of the
+# gradient estimate against each benchmark's exact gradient, rather than derived.
+# Balancing the error bound gives eta ~ n^(-1/4) in finite state space and n^(-1/6) in
+# continuous state space, but its eta term is carried by the dependence of the kernel and
+# policy on the population argument, which is weak here, so the minimiser sits at the top
+# of the admissible range instead. See scripts/verify_discrete_eta.py (finite) and
+# scripts/verify_bounds.py (continuous). Benchmarks absent here fall back to the asymptotic rule.
+LARGE_AUXILIARY_ETAS = (0.85, 0.95, 0.98)
 MEASURED_AUXILIARY_ETA = {
+    "twostate": 0.95,
+    "cybersecurity": 0.98,
     "distribution": 0.98,
+    "advertising": 0.85,
     "lq": 0.95,
     "portfolio": 0.95,
+    # Not measured: the largest radius that keeps every shifted policy valid.
+    # Theta = [0.75, 0.95] and the policy variance 0.99 - 1.01 theta^2 vanishes
+    # at theta = 0.990, so the shared grid {0.85, 0.95, 0.98} is not admissible.
+    "bimodal": 0.04,
 }
 
 
@@ -138,6 +171,12 @@ def auxiliary_eta(env):
     return asymptotic_auxiliary_eta(env)
 
 
+def bound_eta_grid(env):
+    """The radii the bound suggests, eta* = n^(-1/4) halved and doubled, kept below one."""
+    star = effective_auxiliary_samples(env) ** (-0.25)
+    return tuple(round_scale(scale * star) for scale in BOUND_LAMBDA_MULTIPLIERS if scale * star < 1.0)
+
+
 def asymptotic_main_lambda(env, multiplier=1.0):
     return round_scale(multiplier * TRANSPORT_ALLOCATIONS[env]["B"] ** (-0.25))
 
@@ -151,7 +190,7 @@ def transport_per_step_budget(env):
     return allocation["M"] + allocation["n"] + allocation["B"]
 
 
-def transport_job(env, flow="exact", lambda_=None, n_components=None):
+def transport_job(env, flow="exact", lambda_=None, n_components=None, eta=None):
     allocation = TRANSPORT_ALLOCATIONS[env]
     return job(
         env,
@@ -159,7 +198,7 @@ def transport_job(env, flow="exact", lambda_=None, n_components=None):
         allocation["horizon"],
         flow=flow,
         perturbation=asymptotic_main_lambda(env) if lambda_ is None else lambda_,
-        eta=auxiliary_eta(env),
+        eta=auxiliary_eta(env) if eta is None else eta,
         n_components=n_components,
         simplex_sigma=allocation.get("simplex_sigma"),
     )
@@ -217,31 +256,25 @@ def experiment_plan(env):
     allocation = TRANSPORT_ALLOCATIONS[env]
     horizon = allocation["horizon"]
 
-    if env == "twostate":
+    if env in DISCRETE_ENVS:
+        flow = "particle"
         jobs = [job(env, "reinforce", horizon)]
-        for flow in ("exact", "particle"):
-            jobs.append(job(env, "mfreinforce", horizon, flow=flow, perturbation=0.2))
-            jobs.extend(transport_job(env, flow=flow, lambda_=lambda_) for lambda_ in bound_lambda_grid(env))
+        jobs.append(job(env, "mfreinforce", horizon, flow=flow, perturbation=MF_REINFORCE_EPSILON[env]))
+        jobs.extend(transport_job(env, flow=flow, lambda_=lambda_) for lambda_ in bound_lambda_grid(env))
+        if env == "twostate":
+            # The auxiliary radius sweep, at lambda*: the bound's small radii against the large grid.
+            jobs.extend(
+                transport_job(env, flow=flow, eta=eta)
+                for eta in bound_eta_grid(env) + LARGE_AUXILIARY_ETAS
+                if eta != auxiliary_eta(env)
+            )
+        if env == "cybersecurity":
+            jobs.append(job(env, "mfqlearning", horizon))
         return jobs
 
-    if env == "cybersecurity":
-        jobs = [job(env, "reinforce", horizon)]
-        jobs.append(job(env, "mfreinforce", horizon, perturbation=1.0))
-        jobs.extend(transport_job(env, lambda_=lambda_) for lambda_ in bound_lambda_grid(env))
-        jobs.append(job(env, "mfqlearning", horizon))
-        return jobs
-
-    if env == "distribution":
-        jobs = [job(env, "reinforce", horizon)]
-        jobs.append(job(env, "mfreinforce", horizon, perturbation=2.0))
-        jobs.extend(transport_job(env, lambda_=lambda_) for lambda_ in bound_lambda_grid(env))
-        return jobs
-
-    if env == "advertising":
-        jobs = [job(env, "reinforce", horizon)]
-        jobs.append(job(env, "mfreinforce", horizon, perturbation=1.0))
-        jobs.extend(transport_job(env, lambda_=lambda_) for lambda_ in bound_lambda_grid(env))
-        return jobs
+    if env == "bimodal":
+        # Transport-Proba hands the environment a population mean, which this reward does not read.
+        return [job(env, "reinforce", horizon)] + continuous_transport_jobs(env)
 
     if env in CONTINUOUS_ENVS:
         return [job(env, "reinforce", horizon)] + continuous_transport_jobs(env) + gaussian_jobs(env)
@@ -295,6 +328,8 @@ def fair_run_parameters(job_spec):
         selected = MF_REINFORCE_SPLITS.get(env, {})
         parameters["n_particles"] = selected.get("n_particles", ref_particles)
         parameters["n_logit_gradient"] = selected.get("n_logit_gradient", ref_gradient)
+        if allocation is not None:
+            parameters["n_flow_particles"] = allocation["M"]
     elif algorithm == "reinforce":
         if allocation is not None:
             parameters["n_particles"] = transport_per_step_budget(env)
@@ -310,10 +345,10 @@ def fair_run_parameters(job_spec):
         parameters["n_law_gradient"] = allocation["n"]
     elif algorithm == "transport" and allocation is not None:
         parameters["n_particles"] = allocation["B"]
+        parameters["n_flow_particles"] = allocation["M"]
         if env in DISCRETE_ENVS:
             parameters["n_logit_gradient"] = allocation["n"]
         else:
-            parameters["n_flow_particles"] = allocation["M"]
             parameters["n_law_gradient"] = allocation["n"]
     elif algorithm == "mfqlearning" and allocation is None:
         parameters["n_train"] = round(base_cost * (reference["n_train"] if "n_train" in reference else 20_000))

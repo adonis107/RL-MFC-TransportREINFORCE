@@ -44,8 +44,8 @@ import torch
 from torch import nn
 
 from ..environments.randomizers import LawRandomizer
-from .reinforce import exact_continuous_validation_objective
-from .transport import sample_accepts_time
+from .validation import monte_carlo_objective
+from .sampling import sample_accepts_time
 from .timing import report_progress, synchronized_time
 
 
@@ -230,6 +230,14 @@ class GaussianTransport:
             raise NotImplementedError(
                 "GaussianTransport currently supports the tabular continuous-state policies."
             )
+        if getattr(self.env, "per_particle_parameters", False):
+            # One copy of the parameter per sample, in a trailing dimension the environment
+            # reads elementwise: a single backward pass then returns every per-sample gradient.
+            copies = parameters[0].unsqueeze(-1).expand(*parameters[0].shape, states.shape[0]).clone()
+            copies.requires_grad_(True)
+            log_probs = self.env.policy(copies, t_policy, states, laws).log_prob(actions)
+            grads = torch.autograd.grad(log_probs.sum(), copies)[0]
+            return grads.reshape(-1, states.shape[0]).T
         grads = torch.func.vmap(torch.func.grad(log_prob), in_dims=(None, 0, 0, 0))(
             parameters[0], states, laws, actions
         )
@@ -380,8 +388,8 @@ class GaussianTransport:
             if t > 0:
                 centered = states - states.mean()
                 centered_square = states.square() - states.square().mean()
-                mean_gradient = (centered.unsqueeze(-1) * running).mean(dim=0)
-                square_gradient = (centered_square.unsqueeze(-1) * running).mean(dim=0)
+                mean_gradient = centered @ running / n
+                square_gradient = centered_square @ running / n
                 variance_gradient = square_gradient - 2.0 * means[t] * mean_gradient
                 mean_gradients.append(mean_gradient)
                 log_deviation_gradients.append(variance_gradient / (2.0 * deviations[t].square()))
@@ -389,8 +397,8 @@ class GaussianTransport:
             if t == horizon:
                 break
             c_sigma, c_mean = self.score_coefficients(a, b)
-            score = c_sigma.unsqueeze(-1) * log_deviation_gradients[t] + c_mean.unsqueeze(-1) * mean_gradients[t]
-            running = running + score + self.policy_scores(t, states, law, actions)
+            running = running + self.policy_scores(t, states, law, actions)
+            running.addr_(c_sigma, log_deviation_gradients[t]).addr_(c_mean, mean_gradients[t])
 
         return mean_gradients, log_deviation_gradients
 
@@ -449,9 +457,13 @@ class GaussianTransport:
         return gradient, base_return.mean()
 
     def evaluate(self, n_particles=None, horizon=None, seed=None):
-        if hasattr(self.env, "objective"):
-            return exact_continuous_validation_objective(self.env, self.policy)
-        raise NotImplementedError("GaussianTransport validation needs a closed-form objective.")
+        """Monte Carlo objective of the frozen policy with M_val interacting particles."""
+        horizon = getattr(self.env.config, "T_val", self.horizon) if horizon is None else horizon
+        n_particles = self.env.config.validation_particles if n_particles is None else n_particles
+        seed = self.config.seed if seed is None else seed
+        return monte_carlo_objective(
+            self.env, self.policy, self.policy_time, self.discount, n_particles, horizon, seed
+        )
 
     def train(self):
         setup_started_at = synchronized_time(self.env.device)
@@ -475,6 +487,8 @@ class GaussianTransport:
             optimizer.zero_grad()
             self.set_flat_gradient(-gradient)
             optimizer.step()
+            if hasattr(self.env, "project_policy"):
+                self.env.project_policy(self.policy)
             history["train_step_seconds"].append(synchronized_time(self.env.device) - step_started_at)
             history["objective"].append(float(objective.detach().cpu()))
             history["gradient_norm"].append(float(gradient.norm().detach().cpu()))

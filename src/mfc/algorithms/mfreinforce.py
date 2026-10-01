@@ -1,12 +1,13 @@
 from dataclasses import dataclass
 import importlib
-import inspect
 
 import torch
 from torch import nn
 
-from .discrete_validation import evaluate_initial_distributions, evaluate_law, mean_field_next_law
+from .discrete_validation import evaluate_law, mean_field_next_law
+from .sampling import sample_accepts_time
 from .timing import report_progress, synchronized_time
+from .validation import monte_carlo_objective
 
 
 @dataclass(frozen=True)
@@ -127,22 +128,57 @@ class MFReinforce:
         grads = torch.autograd.grad(value, self.trainable_parameters(), allow_unused=True, retain_graph=retain_graph)
         return self.flatten_grads(grads)
 
-    def state_indexed_log_prob_gradients(self, log_probs, target_states):
-        gradients = []
-        for state_index in range(self.env.n_states):
-            weights = (target_states == state_index).to(log_probs.dtype)
-            gradients.append(self.flat_grad((log_probs * weights.unsqueeze(0)).sum(), retain_graph=True))
-        return torch.stack(gradients)
+    def per_sample_log_prob_gradients(self, times, states, laws, actions):
+        """(rows, d_theta) gradient of every row's own action log-probability.
+
+        Row i is the action actions[i] taken in state states[i] at time times[i]
+        under the population argument laws[i]. The auxiliary blocks need these
+        gradients summed by the state each rollout reaches later: computing them
+        once per sample and grouping by a matrix product avoids repeating the
+        per-sample work for every group, and stacking the rows of several times
+        into one call avoids paying the vmap overhead once per time.
+        """
+        times = torch.as_tensor(times, dtype=self.env.dtype, device=self.env.device).expand(states.shape)
+        if isinstance(self.policy, nn.Module):
+            names = [name for name, _ in self.policy.named_parameters()]
+            parameters = tuple(parameter.detach() for parameter in self.policy.parameters())
+
+            def policy_of(values):
+                mapping = dict(zip(names, values))
+                return lambda time, law: torch.func.functional_call(self.policy, mapping, (time, law))
+        else:
+            parameters = (self.policy.detach(),)
+
+            def policy_of(values):
+                return values[0]
+
+        all_states = torch.arange(self.env.n_states, device=self.env.device)
+
+        def log_prob(values, time, state, law, action):
+            # The whole action table, then the sample's entry by one-hot selection: vmap
+            # cannot index by a batched state.
+            table = self.env.policy(policy_of(values), time, all_states, law).clamp_min(1e-12)
+            row = state @ table
+            return torch.log(row @ action / row.sum())
+
+        dtype = self.env.dtype
+        state_indicators = torch.nn.functional.one_hot(states, self.env.n_states).to(dtype)
+        action_indicators = torch.nn.functional.one_hot(actions, self.env.n_actions).to(dtype)
+        law_dim = 0 if laws.ndim == 2 else None
+        grads = torch.func.vmap(torch.func.grad(log_prob), in_dims=(None, 0, 0, law_dim, 0))(
+            parameters, times, state_indicators, laws, action_indicators
+        )
+        return torch.cat([grad.reshape(states.shape[0], -1) for grad in grads], dim=1)
+
+    def state_indicators(self, states):
+        """(n_states, n) indicators of the state each rollout occupies."""
+        return torch.nn.functional.one_hot(states, self.env.n_states).T.to(self.env.dtype)
 
     def sample_initial_distribution(self, generator):
         if hasattr(self.env, "sample_initial_distribution"):
             return self.env.sample_initial_distribution(generator)
         return self.env.initial_distribution
 
-    def validation_initial_distributions(self):
-        if hasattr(self.env, "validation_initial_distributions"):
-            return list(self.env.validation_initial_distributions())
-        return [self.env.initial_distribution]
 
     def initial_state(self, generator, initial_distribution=None):
         probabilities = self.sample_initial_distribution(generator) if initial_distribution is None else initial_distribution
@@ -178,8 +214,7 @@ class MFReinforce:
         return self.flatten_grads(grads)
 
     def sample_next_state(self, t, state, law, action, generator):
-        signature = inspect.signature(self.env.sample)
-        if "t" in signature.parameters:
+        if sample_accepts_time(self.env.sample):
             return self.env.sample(state, law, action, generator, t=t)
         return self.env.sample(state, law, action, generator)
 
@@ -279,7 +314,7 @@ class MFReinforce:
                 generator=generator,
             )
             law_scores = []
-            action_log_probs = []
+            rows = []
 
             for s in range(target_t):
                 law = laws[s]
@@ -288,11 +323,12 @@ class MFReinforce:
                 base_actions, _ = self.sample_actions_with_log_probs(
                     s, base_states, law.expand(self.n_logit_gradient, -1), generator
                 )
-                perturbed_actions, log_probs = self.sample_actions_with_log_probs(
-                    s, perturbed_states, perturbed_law, generator
-                )
-                law_scores.append(noises[s] @ gradients[s] / self.perturbation_eta)
-                action_log_probs.append(log_probs)
+                with torch.no_grad():
+                    perturbed_actions, _ = self.sample_actions_with_log_probs(
+                        s, perturbed_states, perturbed_law, generator
+                    )
+                law_scores.append(noises[s])
+                rows.append((s, perturbed_states, perturbed_law, perturbed_actions))
 
                 with torch.no_grad():
                     base_states = self.sample_next_state(s, base_states, law, base_actions, generator)
@@ -300,10 +336,17 @@ class MFReinforce:
                         s, perturbed_states, perturbed_law, perturbed_actions, generator
                     )
 
-            numerator.index_add_(0, perturbed_states, torch.stack(law_scores).sum(dim=0))
-            numerator = numerator + self.state_indexed_log_prob_gradients(
-                torch.stack(action_log_probs), perturbed_states
+            # Aggregating the noises by terminal state first contracts n x n_states, not n x d_theta.
+            indicators = self.state_indicators(perturbed_states)
+            for s, noise in enumerate(law_scores):
+                numerator = numerator + (indicators @ noise) @ gradients[s] / self.perturbation_eta
+            policy_scores = self.per_sample_log_prob_gradients(
+                torch.cat([torch.full_like(states, s, dtype=self.env.dtype) for s, states, _, _ in rows]),
+                torch.cat([states for _, states, _, _ in rows]),
+                torch.cat([law for _, _, law, _ in rows]),
+                torch.cat([actions for _, _, _, actions in rows]),
             )
+            numerator = numerator + indicators @ policy_scores.reshape(target_t, self.n_logit_gradient, -1).sum(dim=0)
 
             grad_mu = numerator / self.n_logit_gradient
             gradients[target_t] = grad_mu / laws[target_t].clamp_min(1e-12).unsqueeze(-1)
@@ -460,18 +503,12 @@ class MFReinforce:
         return gradient, torch.stack(objectives).mean()
 
     def evaluate(self, n_particles=None, horizon=None, seed=None):
-        """Evaluate by exact deterministic population recursion.
-
-        The n_particles and seed arguments are kept for API compatibility.
-        """
+        """Monte Carlo objective of the frozen policy with M_val interacting particles."""
         horizon = getattr(self.env.config, "T_val", self.horizon) if horizon is None else horizon
-        return evaluate_initial_distributions(
-            self.env,
-            self.policy,
-            self.policy_time,
-            self.discount,
-            self.validation_initial_distributions(),
-            horizon,
+        n_particles = self.env.config.validation_particles if n_particles is None else n_particles
+        seed = self.config.seed if seed is None else seed
+        return monte_carlo_objective(
+            self.env, self.policy, self.policy_time, self.discount, n_particles, horizon, seed
         )
 
     def train(self):
