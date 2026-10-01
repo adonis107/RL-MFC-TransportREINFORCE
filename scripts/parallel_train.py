@@ -66,6 +66,12 @@ def parse_args():
     parser.add_argument("--min-free-memory-gb", type=float, default=6.0)
     parser.add_argument("--sample-interval", type=float, default=15.0)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--exclude-algorithms",
+        nargs="+",
+        default=[],
+        help="algorithms of the plan to leave out, e.g. --exclude-algorithms finitediff",
+    )
     return parser.parse_args()
 
 
@@ -118,6 +124,8 @@ def build_records(args):
 
     for env in selected_envs:
         for job_spec in run_plan.experiment_plan(env):
+            if job_spec["algorithm"] in args.exclude_algorithms:
+                continue
             for seed in args.seeds:
                 train_args = train_args_for(job_spec, seed, args)
                 output_dir = train_script.output_directory(train_args)

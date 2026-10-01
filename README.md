@@ -92,6 +92,11 @@ scripts/run_suite.sh
 ```
 
 Useful overrides: `WORKERS=4`, `CORES=18`, `ENVS="lq portfolio"`, `--no-resume`.
+Leave algorithms out with `--exclude-algorithms`, e.g. `scripts/run_suite.sh --exclude-algorithms finitediff`.
+
+The figures also read diagnostic CSVs under `results/figures/`, which do not depend on the
+training runs. Regenerate them, for instance beside the suite, with
+`THREADS=1 scripts/run_diagnostics.sh`.
 Runs already carrying a `summary.json` are skipped, so the suite resumes.
 
 To follow progress:
