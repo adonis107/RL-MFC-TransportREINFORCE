@@ -48,14 +48,23 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 from mfc.algorithms.transport import ContinuousTransport, ContinuousTransportConfig
 from mfc.environments import LQ, LQConfig, Portfolio, PortfolioConfig
+import run as run_plan
 
 # sign turns each benchmark's objective() into the reward the estimator maximizes.
+def allocation(name):
+    """Horizon, reference lambda* / 2 and the (M, n, B) blocks of the run plan."""
+    blocks = run_plan.TRANSPORT_ALLOCATIONS[name]
+    return (blocks["horizon"], run_plan.asymptotic_main_lambda(name, 0.5),
+            blocks["M"], run_plan.effective_auxiliary_samples(name), blocks["B"])
+
+
 BENCHMARKS = {
-    "lq": (lambda horizon: LQ(LQConfig(T=horizon, device="cpu")), -1.0, 20, 0.154042, 150, 10240, 111),
-    "portfolio": (lambda horizon: Portfolio(PortfolioConfig(T=horizon, device="cpu")), 1.0, 10, 0.13119, 100, 700, 211),
+    "lq": (lambda horizon: LQ(LQConfig(T=horizon, device="cpu")), -1.0, *allocation("lq")),
+    "portfolio": (lambda horizon: Portfolio(PortfolioConfig(T=horizon, device="cpu")), 1.0, *allocation("portfolio")),
 }
 
 ETA_GRID = (0.1, 0.2, 0.3, 0.45, 0.6, 0.75, 0.9, 0.95)

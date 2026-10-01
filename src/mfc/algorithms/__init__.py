@@ -10,3 +10,4 @@ from .transport import (
     train_continuous_transport,
     train_discrete_transport,
 )
+from .finite_difference import FiniteDifference, FiniteDifferenceConfig, train_finite_difference

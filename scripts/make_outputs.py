@@ -95,15 +95,19 @@ LEARNING_PANELS = {
     "Two-state": ("twostate", -2.640),
     "Distribution": ("distribution", -0.056991),
     "Bimodal allocation": ("bimodal", 0.0),
+    "Advertising": ("advertising", 1.018750),
 }
 METHOD_COLOR = {"REINFORCE": "#eb6834", "MF-REINFORCE": "#eda100", "Transport": "#2a78d6",
-                "Transport-Proba": "#7b3fbf", "Transport, K=1": "#8fb8e8"}
+                "Transport-Proba": "#7b3fbf", "Transport, K=1": "#8fb8e8", "Finite differences": "#b5446e"}
 METHOD_MARKER = {"REINFORCE": "s", "MF-REINFORCE": "D", "Transport": "o", "Transport-Proba": "^",
-                 "Transport, K=1": "v"}
+                 "Transport, K=1": "v", "Finite differences": "P"}
 OPTIMAL = "#52514e"
 MFQ_COLOR = "#1baf7a"
-TRADEOFF_COLOR = {"lq": "#2a78d6", "portfolio": "#eb6834", "twostate": "#1baf7a", "distribution": "#eda100"}
-TRADEOFF_MARKER = {"lq": "o", "portfolio": "s", "twostate": "^", "distribution": "D"}
+# Every benchmark with a known optimum; cybersecurity has none, so it has no gap to plot.
+TRADEOFF_COLOR = {"lq": "#2a78d6", "portfolio": "#eb6834", "twostate": "#1baf7a", "distribution": "#eda100",
+                  "advertising": "#008300", "bimodal": "#7b3fbf"}
+TRADEOFF_MARKER = {"lq": "o", "portfolio": "s", "twostate": "^", "distribution": "D", "advertising": "v",
+                   "bimodal": "P"}
 GRID, INK, MUTED = "#d8d7d2", "#0b0b0b", "#52514e"
 
 
@@ -178,6 +182,15 @@ def transport_stem(results_root, env, flow=None, components=None):
     return max(scores, key=lambda stem: sum(scores[stem]) / len(scores[stem]))
 
 
+def finite_difference_stem(results_root, env):
+    """The finite-difference comparator of a continuous benchmark, at its step h = eta."""
+    if env not in run_plan.CONTINUOUS_ENVS:
+        return None
+    horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
+    stem = f"finitediff_h_{run_plan.auxiliary_eta(env):g}_T_{horizon}_exact"
+    return stem if any(env_dir(results_root, env).glob(f"{stem}_seed_*/summary.json")) else None
+
+
 def gaussian_stem(results_root, env):
     """Best Gaussian-manifold transport configuration present for this benchmark."""
     if env not in CONTINUOUS_ENVS:
@@ -234,6 +247,9 @@ def run_stems(results_root, env, include_gaussian=False):
         stem = transport_stem(results_root, env, components=1)
         if stem is not None:
             stems["Transport, K=1"] = stem
+    stem = finite_difference_stem(results_root, env)
+    if stem is not None:
+        stems["Finite differences"] = stem
     if include_gaussian:
         stem = gaussian_stem(results_root, env)
         if stem is not None:
@@ -342,15 +358,22 @@ TITLE_OF = {env: title for title, (env, _) in LEARNING_PANELS.items()}
 OPTIMUM_OF = {env: optimum for _, (env, optimum) in LEARNING_PANELS.items()}
 
 
-def draw_learning_panel(ax, results_root, env, legend_only=False, include_gaussian=False):
-    """Optimality gap against policy updates for one benchmark."""
+def update_budget(env):
+    """Simulated transitions of one update, T (M + n + B), shared by every method of a benchmark."""
+    allocation = run_plan.TRANSPORT_ALLOCATIONS[env]
+    return allocation["horizon"] * run_plan.transport_per_step_budget(env)
+
+
+def draw_learning_panel(ax, results_root, env, legend_only=False, include_gaussian=False, against="updates"):
+    """Optimality gap against policy updates, or against simulated transitions, for one benchmark."""
     optimum = OPTIMUM_OF[env]
+    scale = update_budget(env) / 1e6 if against == "calls" else 1.0
     panel = []
     for method, stem in run_stems(results_root, env, include_gaussian).items():
         seeds = curves(env_dir(results_root, env), stem)
         if seeds is None:
             continue
-        steps = np.arange(1, seeds.shape[1] + 1) * 10
+        steps = np.arange(1, seeds.shape[1] + 1) * 10 * scale
         gaps = np.abs(seeds - seed_optima(env_dir(results_root, env), stem, optimum)[:, None])
         gap, deviation = gaps.mean(axis=0), gaps.std(axis=0)
         panel.extend(gap.tolist())
@@ -384,9 +407,9 @@ def figure_legend(figure, axes, order, ncol):
                   ncol=ncol, frameon=False, handlelength=1.8)
 
 
-FLOW_ORDER = (r"$\theta^\star$", "Transport", "Transport, K=1", "MF-REINFORCE", "REINFORCE")
+FLOW_ORDER = (r"$\theta^\star$", "Transport", "Transport, K=1", "Finite differences", "MF-REINFORCE", "REINFORCE")
 # Only the continuous appendix figure carries the Gaussian-manifold arm.
-PROBA_ORDER = (r"$\theta^\star$", "Transport", "Transport-Proba", "REINFORCE")
+PROBA_ORDER = (r"$\theta^\star$", "Transport", "Transport-Proba", "Finite differences", "REINFORCE")
 
 
 def tensor_policy(path):
@@ -402,6 +425,7 @@ def draw_portfolio_flow(ax, results_root, include_gaussian=False):
     ax.plot(steps, optimal.cpu().numpy(), color=OPTIMAL, linewidth=1.0, dashes=(3, 2), label=r"$\theta^\star$")
     portfolio_dir = env_dir(results_root, "portfolio")
     drawn = {"Transport": transport_stem(results_root, "portfolio", components=1),
+             "Finite differences": finite_difference_stem(results_root, "portfolio"),
              "REINFORCE": "reinforce_none_T_10_exact"}
     if include_gaussian:
         drawn["Transport-Proba"] = gaussian_stem(results_root, "portfolio")
@@ -436,6 +460,7 @@ def draw_lq_flow(ax, results_root, include_gaussian=False):
             linewidth=1.0, dashes=(3, 2), label=r"$\theta^\star$")
     lq_dir = env_dir(results_root, "lq")
     drawn = {"Transport": transport_stem(results_root, "lq", components=1),
+             "Finite differences": finite_difference_stem(results_root, "lq"),
              "REINFORCE": "reinforce_none_T_20_exact"}
     if include_gaussian:
         drawn["Transport-Proba"] = gaussian_stem(results_root, "lq")
@@ -556,7 +581,8 @@ def main_benchmarks(results_root, output):
         return
     figure, axes = plt.subplots(2, len(envs), figsize=(5.5, 3.4), constrained_layout=True, squeeze=False)
     for index, env in enumerate(envs):
-        draw_learning_panel(axes[0, index], results_root, env)
+        draw_learning_panel(axes[0, index], results_root, env, against="calls")
+        axes[0, index].set_xlabel("simulated transitions (millions)", fontsize=7.5)
         FLOW_PANEL[env](axes[1, index], results_root)
     axes = axes.ravel()
     # Three panels across the text width leave no room for the default tick density.
@@ -754,7 +780,8 @@ def lambda_sweep(results_root, env, filter_text, flow, horizon, optimum):
         stem = re.sub(r"_seed_\d+$", "", path.name)
         if filter_text is not None and filter_text not in stem:
             continue
-        if "_K_" in stem and "_K_1_" not in stem:
+        components = TRANSPORT_COMPONENTS.get(env)
+        if components is not None and f"_K_{components}_" not in stem:
             continue
         summary = path / "summary.json"
         if not summary.exists():
@@ -794,7 +821,7 @@ def lambda_tradeoff(results_root, output):
     ax.set_ylabel("optimality gap / best gap")
     style(ax)
     # Explicit decade-free ticks: the default log locator collides on this narrow range.
-    ticks = [0.05, 0.1, 0.2, 0.4, 0.8]
+    ticks = [0.01, 0.03, 0.1, 0.3]
     ax.set_xticks(ticks)
     ax.set_xticklabels([f"{t:g}" for t in ticks])
     ax.tick_params(axis="x", which="minor", length=0)
@@ -935,10 +962,11 @@ def theory_verification(estimate_csv, consistency_csv, output):
         return
 
     display = {"twostate": "Two-state", "cybersecurity": "Cybersecurity", "distribution": "Distribution",
-               "advertising": "Advertising", "lq": "Linear-quadratic", "portfolio": "Portfolio"}
-    order = ["lq", "portfolio", "twostate", "distribution", "cybersecurity", "advertising"]
-    color = dict(zip(order, ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]))
-    marker = dict(zip(order, ["o", "s", "^", "D", "v", "P"]))
+               "advertising": "Advertising", "lq": "Linear-quadratic", "portfolio": "Portfolio",
+               "bimodal": "Bimodal"}
+    order = ["lq", "portfolio", "bimodal", "twostate", "distribution", "cybersecurity", "advertising"]
+    color = dict(zip(order, ["#2a78d6", "#eb6834", "#7b3fbf", "#1baf7a", "#eda100", "#e87ba4", "#008300"]))
+    marker = dict(zip(order, ["o", "s", "X", "^", "D", "v", "P"]))
     ticks = [0.0125, 0.025, 0.05, 0.1, 0.2, 0.4]
 
     estimate = pd.read_csv(estimate_csv)
@@ -983,13 +1011,23 @@ def theory_verification(estimate_csv, consistency_csv, output):
         ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
         style(ax)
     handles, labels = axes[0].get_legend_handles_labels()
-    figure.legend(handles, labels, loc="outside lower center", ncol=6, frameon=False,
+    figure.legend(handles, labels, loc="outside lower center", ncol=4, frameon=False,
                   handlelength=1.8, columnspacing=1.0, borderpad=0.2)
     save_figure(figure, output)
 
 
-BOUND_COLOR = {"lq": "#2a78d6", "portfolio": "#eb6834"}
-BOUND_MARKER = {"lq": "o", "portfolio": "s"}
+BOUND_COLOR = {"lq": "#2a78d6", "portfolio": "#eb6834", "twostate": "#1baf7a", "cybersecurity": "#e87ba4",
+               "distribution": "#eda100", "advertising": "#008300"}
+BOUND_MARKER = {"lq": "o", "portfolio": "s", "twostate": "^", "cybersecurity": "v", "distribution": "D",
+                "advertising": "P"}
+BOUND_ENVS = ("lq", "portfolio", "twostate", "cybersecurity", "distribution", "advertising")
+
+
+def load_bounds(bounds_csv):
+    """The continuous sweeps and, beside them, every finite-state sweep file present."""
+    paths = [Path(bounds_csv)] + sorted(Path(bounds_csv).parent.glob("bounds_discrete*.csv"))
+    tables = [pd.read_csv(path) for path in paths if path.exists()]
+    return pd.concat(tables, ignore_index=True) if tables else None
 
 
 def bound_slope(x, y):
@@ -1007,11 +1045,11 @@ def guide(ax, x, y, exponent, anchor=0):
     ax.plot(x, scale * x**exponent, color=MUTED, linewidth=0.7, dashes=(2, 2), zorder=1)
 
 
-def _bounds_table(bounds_csv):
-    if not Path(bounds_csv).exists():
+def _bounds_table(bounds_csv, envs=BOUND_ENVS):
+    table = load_bounds(bounds_csv)
+    if table is None:
         return None, []
-    table = pd.read_csv(bounds_csv)
-    return table, [env for env in ("lq", "portfolio") if (table["env"] == env).any()]
+    return table, [env for env in envs if (table["env"] == env).any()]
 
 
 def _annotate_slope(ax, x, y, reference, fitted=None):
@@ -1039,7 +1077,7 @@ def _finish(ax, xlabel, ylabel, title=None):
 
 def bounds_radius(bounds_csv, output):
     """The auxiliary radius: total sensitivity error against its centred-difference part."""
-    table, envs = _bounds_table(bounds_csv)
+    table, envs = _bounds_table(bounds_csv, ("lq", "portfolio"))
     if not envs:
         print("skipping bounds_radius: no bounds CSV")
         return
@@ -1070,9 +1108,9 @@ RATE_PANELS = [
 ]
 
 
-def bounds_rates(bounds_csv, output):
+def bounds_rates(bounds_csv, output, envs=("lq", "portfolio")):
     """One sweep per panel: each block size, the scale, and the main block."""
-    table, envs = _bounds_table(bounds_csv)
+    table, envs = _bounds_table(bounds_csv, envs)
     if not envs:
         print("skipping bounds_rates: no bounds CSV")
         return
@@ -1111,10 +1149,9 @@ BOUND_SWEEPS = [
 
 def bounds_exponents(bounds_csv):
     """Fitted log-log exponents of every sweep against the rate the bound predicts."""
-    if not Path(bounds_csv).exists():
+    table, envs = _bounds_table(bounds_csv)
+    if table is None:
         return None
-    table = pd.read_csv(bounds_csv)
-    envs = [env for env in ("lq", "portfolio") if (table["env"] == env).any()]
     header = " & ".join(["Quantity", "Swept"] + [DISPLAY[env] for env in envs] + ["$p_0$"])
     lines = [header + " \\\\", "\\midrule"]
     for sweep, knob, quantity, column, exponent in BOUND_SWEEPS:
@@ -1129,8 +1166,9 @@ def bounds_exponents(bounds_csv):
         lines.append(" & ".join([quantity, knob] + cells + [f"${exponent:+.0f}$"]) + " \\\\")
     caption = (
         "Slope $p$ of each error against the quantity swept, fitted by least squares on a log-log "
-        "scale at $\\theta=\\tfrac12\\theta^\\star$, with $p_0$ the slope of the mechanism "
-        "producing it. The $\\lambda$ row is fitted on $\\lambda\\leq0.1$."
+        "scale, at $\\theta=\\tfrac12\\theta^\\star$ on the continuous benchmarks and at the initial "
+        "policy on the finite ones, with $p_0$ the slope of the mechanism producing it. The $\\lambda$ "
+        "row is fitted on the lower half of its grid."
     )
     return table_environment("\n".join(lines), caption, "tab:bounds-exponents",
                              "ll" + "r" * len(envs) + "r", size="\\small")
@@ -1145,6 +1183,8 @@ def method_of(label):
         return "mfqlearning"
     if label.startswith("MF-REINFORCE"):
         return "mfreinforce"
+    if label.startswith("Finite differences"):
+        return "finitediff"
     return "transport"
 
 
@@ -1192,7 +1232,8 @@ def select_headline(grouped, env):
     horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
     flow = MAIN_FLOW[env]
     subset = grouped[grouped["horizon"] == horizon]
-    subset = subset[(subset["flow"] == flow) | (subset["method"] == "reinforce")]
+    # REINFORCE and finite differences have no population flow of their own to choose.
+    subset = subset[(subset["flow"] == flow) | subset["method"].isin(["reinforce", "finitediff"])]
     best = {}
     for method, rows in subset.groupby("method"):
         rows = rows.dropna(subset=["mean"])
@@ -1218,7 +1259,7 @@ def reference_optimum(results_root, env):
 def objective_summary(results_root):
     lines = [
         "Benchmark & Optimum & REINFORCE & MF-REINFORCE & Transport & $(\\lambda,\\eta)$ "
-        "& Transport-Proba & $\\lambda$ \\\\",
+        "& Transport-Proba & $\\lambda$ & Finite diff. \\\\",
         "\\midrule",
     ]
     for env in [name for name in BENCHMARKS if has_run(results_root, name)]:
@@ -1250,6 +1291,7 @@ def objective_summary(results_root):
                     scales,
                     with_error(gaussian, digits),
                     proba_scale,
+                    with_error(best.get("finitediff"), digits),
                 ]
             )
             + " \\\\"
@@ -1259,7 +1301,7 @@ def objective_summary(results_root):
         "Higher is better. The transport column shows the best fixed-scale run among the bound-scale "
         "multipliers and the asymptotic anchor scales used for the benchmark."
     )
-    return table_environment("\n".join(lines), caption, "tab:objective-summary", "lrrrrlrl", size="\\small")
+    return table_environment("\n".join(lines), caption, "tab:objective-summary", "lrrrrlrlr", size="\\small")
 
 
 ESTIMATORS = [
@@ -1267,6 +1309,7 @@ ESTIMATORS = [
     ("mfreinforce", "MF-REINFORCE"),
     ("transport", "Transport"),
     ("gaussian", "Transport-Proba"),
+    ("finitediff", "Finite differences"),
     ("mfqlearning", "MFQ-learning"),
 ]
 SCALE_COUNT = {"transport": "$\\lambda,\\eta$", "gaussian": "$\\lambda$"}
@@ -1277,7 +1320,7 @@ def runtime_rows(results_root, env, scales_column):
     runtime = runtime_table(load_env_runs(results_root, env))
     horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
     subset = runtime[runtime["horizon"] == horizon]
-    subset = subset[(subset["flow"] == MAIN_FLOW[env]) | (subset["algorithm"] == "reinforce")]
+    subset = subset[(subset["flow"] == MAIN_FLOW[env]) | subset["algorithm"].isin(["reinforce", "finitediff"])]
     reference = subset[subset["algorithm"] == "reinforce"]
     reference_seconds = float(reference["elapsed_seconds_mean"].iloc[0]) if not reference.empty else None
 
@@ -1341,6 +1384,7 @@ CONTINUOUS_STEMS = [
     ("reinforce", "REINFORCE", "reinforce_none_T_{horizon}_exact"),
     ("transport", "Transport", "transport_lambda_{lambda_}_eta_{eta}_K_1_T_{horizon}_particle"),
     ("gaussian", "Transport-Proba", "gaussian_lambda_{lambda_}_T_{horizon}_particle"),
+    ("finitediff", "Finite differences", "finitediff_h_{lambda_}_T_{horizon}_exact"),
 ]
 
 
@@ -1348,10 +1392,14 @@ def scale_grid(results_root, env, algorithm):
     """Every perturbation scale this results tree holds for one continuous arm."""
     horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
     found = set()
-    for path in env_dir(results_root, env).glob(f"{algorithm}_lambda_*_T_{horizon}_particle_seed_*"):
+    if algorithm == "finitediff":
+        pattern, scale = f"finitediff_h_*_T_{horizon}_exact_seed_*", r"_h_([0-9.]+)_"
+    else:
+        pattern, scale = f"{algorithm}_lambda_*_T_{horizon}_particle_seed_*", r"lambda_([0-9.]+)"
+    for path in env_dir(results_root, env).glob(pattern):
         if algorithm == "transport" and "_K_1_" not in path.name:
             continue
-        found.add(float(re.search(r"lambda_([0-9.]+)", path.name).group(1)))
+        found.add(float(re.search(scale, path.name).group(1)))
     return sorted(found)
 
 
@@ -1445,6 +1493,9 @@ def bimodal_components(results_root):
         "\\midrule",
     ]
     configurations = [("REINFORCE", None, f"reinforce_none_T_{horizon}_exact")]
+    stem = finite_difference_stem(results_root, "bimodal")
+    if stem is not None:
+        configurations.append(("Finite differences", None, stem))
     for components in run_plan.CONTINUOUS_COMPONENTS["bimodal"]:
         stems = {
             re.sub(r"_seed_\d+$", "", path.name)
@@ -1502,6 +1553,42 @@ def headline_row(rows, results_root, env, algorithm):
     return rows.iloc[rows["elapsed_seconds_mean"].to_numpy().argmax()]
 
 
+def allocation_table():
+    """Run-plan settings of every benchmark, read from scripts/run.py."""
+    lines = [
+        "Benchmark & $T$ & $M$ & $n$ & $B$ & Budget & Updates & Step size & $\\lambda_\\star$ & $\\eta$ & $\\sigma$ & $K$ \\\\",
+        "\\midrule",
+    ]
+    for env in BENCHMARKS:
+        allocation = run_plan.TRANSPORT_ALLOCATIONS[env]
+        n = run_plan.effective_auxiliary_samples(env)
+        budget = allocation["horizon"] * (allocation["M"] + n + allocation["B"])
+        sigma = allocation.get("simplex_sigma")
+        components = run_plan.CONTINUOUS_COMPONENTS.get(env)
+        lines.append(" & ".join([
+            DISPLAY[env],
+            str(allocation["horizon"]),
+            f"{allocation['M']:,}".replace(",", "\\,"),
+            f"{n:,}".replace(",", "\\,"),
+            f"{allocation['B']:,}".replace(",", "\\,"),
+            f"{budget:,}".replace(",", "\\,"),
+            f"{allocation['updates']:,}".replace(",", "\\,"),
+            f"$10^{{{int(round(np.log10(allocation['lr'])))}}}$",
+            f"${run_plan.asymptotic_main_lambda(env):.3g}$",
+            f"${run_plan.auxiliary_eta(env):g}$",
+            "---" if sigma is None else f"${sigma:g}$",
+            "---" if components is None else ",".join(str(k) for k in components),
+        ]) + " \\\\")
+    caption = (
+        "Transport allocations and optimization settings. $M$, $n$ and $B$ are the population, auxiliary "
+        "and main sample sizes, and the budget is the resulting number of simulated transitions per "
+        "update, $T(M+n+B)$, which every method of a benchmark receives. Transport is trained at "
+        "$\\lambda\\in\\lambda_\\star\\{1/8,1/4,1/2,1,2\\}$, with $\\lambda_\\star=B^{-1/4}$; $\\sigma$ is the "
+        "finite-state simplex randomizer scale and $K$ the number of mixture components."
+    )
+    return table_environment("\n".join(lines), caption, "tab:allocations", "lrrrrrrrrrrr", size="\\small")
+
+
 def write_table(body, path):
     path = ensure_dir(path)
     path.write_text(body, encoding="utf-8")
@@ -1537,10 +1624,13 @@ def main():
     if eta_table is not None:
         write_table(eta_table, tables / "discrete_eta.tex")
     theory_verification(ROOT / args.theory_estimate, ROOT / args.theory_consistency, figures / "theory_verification.pdf")
+    write_table(allocation_table(), tables / "allocations.tex")
     write_table(objective_summary(results_root), tables / "objective_summary.tex")
     write_table(budget_runtime(results_root), tables / "budget_runtime.tex")
     bounds_radius(ROOT / args.bounds, figures / "bounds_radius.pdf")
     bounds_rates(ROOT / args.bounds, figures / "bounds_rates.pdf")
+    bounds_rates(ROOT / args.bounds, figures / "bounds_rates_finite.pdf",
+                 ("twostate", "cybersecurity", "distribution", "advertising"))
     exponents = bounds_exponents(ROOT / args.bounds)
     if exponents is not None:
         write_table(exponents, tables / "bounds_exponents.tex")

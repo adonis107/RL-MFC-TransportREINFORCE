@@ -45,18 +45,21 @@ CONTINUOUS_COMPONENTS = {
     "bimodal": (1, 2),
 }
 
-# Transport allocation from the ICLR reference table. Here M is the population
-# block, n the auxiliary sensitivity block, and B the main trajectory block. Every
-# headline run reads the population off M interacting particles, finite benchmarks
-# included; M is the particle count of the MF-REINFORCE reference, and every method of
-# a benchmark gets the same population block.
+# Transport allocations: M is the population block, n the auxiliary sensitivity block and
+# B the main trajectory block, for a cost of T (M + n + B) transitions per update.
+#   finite      n + B matches the published MF-REINFORCE cost per update, split between n
+#               and B by gradient MSE against the oracle; M is the particle count of that
+#               reference, and every method of a benchmark gets the same population block.
+#   continuous  n = 2 d_theta * 128, that is 128 particles per shifted system; the bimodal
+#               benchmark (d_theta = 1) instead gives each of its two systems 4000 particles,
+#               which its two-component fits need.
 TRANSPORT_ALLOCATIONS = {
     "twostate": {
         "horizon": 5,
         "M": 200,
         "n": 12,
         "B": 248,
-        "updates": 10_000,
+        "updates": 20_000,
         "lr": 1e-3,
         "simplex_sigma": 0.75,
     },
@@ -67,7 +70,7 @@ TRANSPORT_ALLOCATIONS = {
         "B": 153,
         "updates": 20_000,
         "lr": 1e-3,
-        "simplex_sigma": 1.0,
+        "simplex_sigma": 0.75,
     },
     "distribution": {
         "horizon": 5,
@@ -120,7 +123,12 @@ TRANSPORT_ALLOCATIONS = {
     },
 }
 
-BOUND_LAMBDA_MULTIPLIERS = (0.5, 1.0, 2.0)
+# Main scales lambda* times these, with lambda* = B^(-1/4) the order of the bound. The
+# grid reaches down to lambda*/8: in earlier sweeps the best scale sat below lambda*/2 on
+# two-state control and both continuous benchmarks, and near lambda* on the others.
+BOUND_LAMBDA_MULTIPLIERS = (0.125, 0.25, 0.5, 1.0, 2.0)
+# Auxiliary radii the bound suggests, eta* = n^(-1/4) halved and doubled (two-state sweep).
+BOUND_ETA_MULTIPLIERS = (0.5, 1.0, 2.0)
 
 
 def round_scale(value):
@@ -138,7 +146,9 @@ def effective_auxiliary_samples(env):
 
 
 # Auxiliary radius, selected in LARGE_AUXILIARY_ETAS by the mean-square error of the
-# gradient estimate against each benchmark's exact gradient, rather than derived.
+# gradient estimate against each benchmark's exact gradient, rather than derived. In finite
+# state space it is selected jointly with simplex_sigma by scripts/tune_perturbation.py, at
+# lambda* and over three warm-started reference policies.
 # Balancing the error bound gives eta ~ n^(-1/4) in finite state space and n^(-1/6) in
 # continuous state space, but its eta term is carried by the dependence of the kernel and
 # policy on the population argument, which is weak here, so the minimiser sits at the top
@@ -146,10 +156,10 @@ def effective_auxiliary_samples(env):
 # scripts/verify_bounds.py (continuous). Benchmarks absent here fall back to the asymptotic rule.
 LARGE_AUXILIARY_ETAS = (0.85, 0.95, 0.98)
 MEASURED_AUXILIARY_ETA = {
-    "twostate": 0.95,
+    "twostate": 0.98,
     "cybersecurity": 0.98,
     "distribution": 0.98,
-    "advertising": 0.85,
+    "advertising": 0.95,
     "lq": 0.95,
     "portfolio": 0.95,
     # Not measured: the largest radius that keeps every shifted policy valid.
@@ -174,7 +184,7 @@ def auxiliary_eta(env):
 def bound_eta_grid(env):
     """The radii the bound suggests, eta* = n^(-1/4) halved and doubled, kept below one."""
     star = effective_auxiliary_samples(env) ** (-0.25)
-    return tuple(round_scale(scale * star) for scale in BOUND_LAMBDA_MULTIPLIERS if scale * star < 1.0)
+    return tuple(round_scale(scale * star) for scale in BOUND_ETA_MULTIPLIERS if scale * star < 1.0)
 
 
 def asymptotic_main_lambda(env, multiplier=1.0):
@@ -239,6 +249,18 @@ def gaussian_jobs(env):
             for lambda_ in bound_lambda_grid(env)]
 
 
+def finite_difference_job(env):
+    """Finite differences of the objective on the shifted systems of the transport auxiliary stage.
+
+    Same systems theta +- eta e_l, same radius eta, independent draws, but the whole budget
+    T (M + n + B) and the particle objective differenced directly. The step is the transport
+    radius: the objectives are quadratic in each coordinate, so without common random numbers
+    the gradient error falls as the step grows, and eta is the largest step of the candidate
+    grid (scripts/tune_finite_difference.py).
+    """
+    return job(env, "finitediff", TRANSPORT_ALLOCATIONS[env]["horizon"], perturbation=auxiliary_eta(env))
+
+
 def continuous_transport_jobs(env, components=None):
     """Continuous transport arm: bound-scale lambda multipliers times mixture sizes."""
     components = CONTINUOUS_COMPONENTS[env] if components is None else components
@@ -272,12 +294,10 @@ def experiment_plan(env):
             jobs.append(job(env, "mfqlearning", horizon))
         return jobs
 
-    if env == "bimodal":
-        # Transport-Proba hands the environment a population mean, which this reward does not read.
-        return [job(env, "reinforce", horizon)] + continuous_transport_jobs(env)
-
     if env in CONTINUOUS_ENVS:
-        return [job(env, "reinforce", horizon)] + continuous_transport_jobs(env) + gaussian_jobs(env)
+        jobs = [job(env, "reinforce", horizon), finite_difference_job(env)] + continuous_transport_jobs(env)
+        # Transport-Proba hands the environment a population mean, which the bimodal reward does not read.
+        return jobs if env == "bimodal" else jobs + gaussian_jobs(env)
 
     raise ValueError(f"Unknown environment: {env}")
 
@@ -330,7 +350,7 @@ def fair_run_parameters(job_spec):
         parameters["n_logit_gradient"] = selected.get("n_logit_gradient", ref_gradient)
         if allocation is not None:
             parameters["n_flow_particles"] = allocation["M"]
-    elif algorithm == "reinforce":
+    elif algorithm in {"reinforce", "finitediff"}:
         if allocation is not None:
             parameters["n_particles"] = transport_per_step_budget(env)
         else:
@@ -434,6 +454,40 @@ def command_for(job_spec, seed, args):
     return command
 
 
+def manifest_rows(envs, seeds, args):
+    """One row per configuration of the plan: what is run, with which settings and budget."""
+    rows = []
+    for env in envs:
+        for job_spec in experiment_plan(env):
+            parameters = fair_run_parameters(job_spec)
+            algorithm = job_spec["algorithm"]
+            allocation = TRANSPORT_ALLOCATIONS[env]
+            command = command_for(job_spec, seeds[0], args)
+            rows.append({
+                "env": env,
+                "algorithm": algorithm,
+                "flow": job_spec["flow"],
+                "scale": job_spec["perturbation"],
+                "scale_name": {"transport": "lambda", "gaussian": "lambda", "mfreinforce": "epsilon",
+                               "finitediff": "h"}.get(algorithm),
+                "eta": job_spec.get("eta") if algorithm == "transport" else None,
+                "n_components": job_spec.get("n_components"),
+                "simplex_sigma": job_spec.get("simplex_sigma") if algorithm == "transport" else None,
+                "horizon": job_spec["horizon"],
+                "updates": parameters.get("n_train"),
+                "lr": parameters.get("lr"),
+                "n_particles": parameters.get("n_particles"),
+                "auxiliary": parameters.get("n_logit_gradient", parameters.get("n_law_gradient")),
+                "population": parameters.get("n_flow_particles"),
+                "budget_per_update": None if algorithm == "mfqlearning"
+                else allocation["horizon"] * transport_per_step_budget(env),
+                "seeds": " ".join(str(seed) for seed in seeds),
+                "command": " ".join(["python scripts/train.py"] + [str(part) for part in command[2:]])
+                .replace(f"--seed {seeds[0]}", "--seed SEED"),
+            })
+    return rows
+
+
 def parse_seed_list(value):
     return [int(seed) for seed in value.split(",") if seed.strip()]
 
@@ -467,6 +521,8 @@ def parse_args():
     parser.add_argument("--no-baseline", action="store_true")
     parser.add_argument("--no-reuse-state-gradient", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--manifest", type=Path, default=None,
+                        help="write every configuration of the plan, with its settings, to this CSV and exit")
     return parser.parse_args()
 
 
@@ -476,6 +532,18 @@ def main():
         raise ValueError("Use at most one of --baseline and --no-baseline.")
 
     selected_envs = PRIMARY_ENVS if args.env == "all" else [args.env]
+
+    if args.manifest is not None:
+        import csv
+
+        rows = manifest_rows(selected_envs, args.seeds, args)
+        args.manifest.parent.mkdir(parents=True, exist_ok=True)
+        with args.manifest.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"wrote {len(rows)} configurations x {len(args.seeds)} seeds to {args.manifest}")
+        return
 
     commands = []
     for env in selected_envs:

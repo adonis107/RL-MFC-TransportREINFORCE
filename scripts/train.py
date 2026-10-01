@@ -1,6 +1,7 @@
 import argparse
 import importlib
 import json
+import subprocess
 import time
 from dataclasses import asdict, fields, replace
 from pathlib import Path
@@ -16,6 +17,8 @@ from mfc.algorithms import (
     GaussianTransportConfig,
     DiscreteTransport,
     DiscreteTransportConfig,
+    FiniteDifference,
+    FiniteDifferenceConfig,
     MeanFieldQLearning,
     MeanFieldQLearningConfig,
     MFReinforce,
@@ -133,7 +136,9 @@ def asymptotic_bound_scales(args, algorithm):
     }
 
 
-def perturbation_label(algorithm, perturbation, eta):
+def perturbation_label(algorithm, perturbation, eta, common_random_numbers=False):
+    if algorithm == "finitediff":
+        return f"h_{perturbation:g}" + ("_crn" if common_random_numbers else "")
     if algorithm == "gaussian":
         return f"lambda_{perturbation:g}"
     if algorithm == "reinforce":
@@ -149,7 +154,7 @@ def perturbation_label(algorithm, perturbation, eta):
 
 def output_directory(args, algorithm=None):
     eta = metadata_eta(args, algorithm) if algorithm is not None else args.eta
-    label = perturbation_label(args.algorithm, args.perturbation, eta)
+    label = perturbation_label(args.algorithm, args.perturbation, eta, getattr(args, "common_random_numbers", False))
     if args.algorithm == "mfqlearning":
         label = f"Nm_{args.simplex_resolution}"
     components = getattr(args, "n_components", None)
@@ -223,6 +228,16 @@ def build_algorithm(args, env):
             reuse_state_gradient=not args.no_reuse_state_gradient,
         )
         return MFReinforce(env, config=config)
+
+    if args.algorithm == "finitediff":
+        if args.env not in CONTINUOUS_ENVS:
+            raise ValueError("The finite-difference comparator is configured for continuous-state environments.")
+        if args.perturbation is None:
+            raise ValueError("Finite differences require --perturbation h, the step.")
+        config = FiniteDifferenceConfig(
+            **common, step=args.perturbation, common_random_numbers=args.common_random_numbers
+        )
+        return FiniteDifference(env, config=config)
 
     if args.algorithm == "gaussian":
         if args.env not in CONTINUOUS_ENVS:
@@ -312,6 +327,9 @@ def simulator_budget_estimate(algorithm):
         flow_particles = getattr(algorithm, "n_flow_particles", particles)
         flow_extra = flow_particles * horizon
 
+    if isinstance(algorithm, FiniteDifference):
+        return horizon * 2 * algorithm.n_parameters * algorithm.particles_per_system
+
     if isinstance(algorithm, Reinforce):
         return particles * horizon
 
@@ -342,8 +360,19 @@ def simulator_budget_estimate(algorithm):
     return None
 
 
+def code_version():
+    """Commit of the code a run was trained with, marked dirty when the tree has local changes."""
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True)
+        status = subprocess.run(["git", "status", "--porcelain", "--", "src", "scripts"], cwd=ROOT,
+                                capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return commit.stdout.strip() + ("-dirty" if status.stdout.strip() else "")
+
+
 def metadata_eta(args, algorithm):
-    if args.algorithm in {"reinforce", "gaussian"}:
+    if args.algorithm in {"reinforce", "gaussian", "finitediff"}:
         return None
     if args.algorithm == "mfreinforce":
         return algorithm.perturbation_eta
@@ -392,6 +421,7 @@ def run_training(args):
         "horizon": args.horizon,
         "flow": args.flow,
         "seed": args.seed,
+        "code_version": code_version(),
         # asdict() only sees dataclass fields, so an environment that derives its
         # per-step discount from a rate (cybersecurity: gamma ** dt) would not record the
         # value the algorithms actually use. Record it explicitly.
@@ -455,7 +485,7 @@ def parse_args():
     parser.add_argument(
         "--algorithm",
         "--alg",
-        choices=["reinforce", "mfreinforce", "transport", "gaussian", "mfqlearning"],
+        choices=["reinforce", "mfreinforce", "transport", "gaussian", "finitediff", "mfqlearning"],
         required=True,
     )
     parser.add_argument("--perturbation", type=maybe_float, default=None)
@@ -482,6 +512,11 @@ def parse_args():
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--no-baseline", action="store_true")
     parser.add_argument("--no-reuse-state-gradient", action="store_true")
+    parser.add_argument(
+        "--common-random-numbers",
+        action="store_true",
+        help="finite differences: drive the two systems of a coordinate with the same draws",
+    )
     args = parser.parse_args()
     if args.flow is None:
         args.flow = default_flow(args)

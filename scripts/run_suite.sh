@@ -56,3 +56,5 @@ done
 echo "================ figures and tables ================"
 uv run python scripts/make_outputs.py --results-root "${RESULTS_ROOT}" \
     --output-root outputs
+uv run python scripts/decomposition.py --root "${RESULTS_ROOT}" \
+    --tex outputs/tables/decomposition.tex

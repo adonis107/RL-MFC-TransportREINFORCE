@@ -10,6 +10,7 @@ wheels/
 .venv
 
 # Folders
+archive/
 files/
 results/
 outputs/

@@ -86,7 +86,7 @@ class Bimodal:
     # m -> int exp(-y^2 / (2 w^2)) m(dy). REINFORCE reads it off its particles;
     # the mixture chart integrates it exactly against every component.
     def empirical_law(self, states):
-        return self.kernel(states).mean().detach()
+        return self.kernel(states).mean(dim=-1).detach()
 
     def state_law_features(self, states):
         return self.kernel(states).unsqueeze(-1)

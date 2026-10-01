@@ -76,6 +76,8 @@ def run_label(metadata):
         return f"MF-REINFORCE eps={metadata['perturbation']:g}"
     if algorithm == "gaussian":
         return f"Transport-Proba lambda={metadata['perturbation']:g}"
+    if algorithm == "finitediff":
+        return f"Finite differences h={metadata['perturbation']:g}"
     label = f"Transport lambda={metadata['perturbation']:g}"
     eta = metadata.get("eta")
     if eta is not None:

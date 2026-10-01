@@ -14,7 +14,9 @@ V2, perturbation consistency. |J^lambda - J| and ||grad J^lambda - grad J|| are 
 Finite-state benchmarks carry an exact population recursion, so for a fixed draw of the perturbation
 path the objective and its gradient are exact; common random numbers across lambda make the
 difference smooth. The continuous mixture-transport objective has no closed-form oracle in these
-benchmark environments, so this script does not print a continuous V2 curve.
+benchmark environments in general. Linear-quadratic control and the portfolio read the population
+only through its mean, and their J^lambda under the transport randomizer is then exact (see
+mfc.environments.randomizers), so their V2 curves are exact; the bimodal benchmark has none.
 
     uv run python scripts/verify_theory.py --part all
 """
@@ -30,12 +32,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import run as run_plan
 from correction_alignment import build_env, reference_policy
 from mfc.algorithms.transport import DiscreteTransport, DiscreteTransportConfig
 from mfc.visualization.tables import save_table
 
 DISCRETE = {"twostate": 5, "cybersecurity": 3, "distribution": 5, "advertising": 5}
-CONTINUOUS = {"lq": 20, "portfolio": 10}
+CONTINUOUS = {"lq": 20, "portfolio": 10, "bimodal": 1}
+# Continuous benchmarks with a closed-form perturbed objective, for V2.
+CONTINUOUS_EXACT = {"lq": -1.0, "portfolio": 1.0}
 LAMBDAS = (0.4, 0.2, 0.1, 0.05, 0.025, 0.0125)
 REFERENCE_STEPS = 200
 
@@ -77,7 +82,8 @@ def flat_grad(value, algorithm):
 def v1_discrete(name, horizon, device, seed, draws):
     env = build_env(name, device)
     algorithm = reference_policy(env, horizon, REFERENCE_STEPS, seed)
-    estimator = DiscreteTransport(env, policy=algorithm.policy, config=DiscreteTransportConfig(horizon=horizon))
+    estimator = DiscreteTransport(env, policy=algorithm.policy, config=DiscreteTransportConfig(
+        horizon=horizon, simplex_sigma=run_plan.TRANSPORT_ALLOCATIONS[name]["simplex_sigma"]))
     generator = torch.Generator(device=env.device)
     generator.manual_seed(seed)
 
@@ -107,7 +113,8 @@ def v1_continuous(name, horizon, device, seed, draws):
     env = build_env(name, device)
     algorithm = reference_policy(env, horizon, REFERENCE_STEPS, seed)
     estimator = ContinuousTransport(env, policy=algorithm.policy, config=ContinuousTransportConfig(
-        horizon=horizon, flow="particle", n_components=1, seed=seed))
+        horizon=horizon, flow="particle", seed=seed,
+        n_components=max(run_plan.CONTINUOUS_COMPONENTS.get(name, (1,)))))
     coordinates, _ = estimator.population_coordinates(seed=seed, jacobians=False)
     generator = torch.Generator(device=env.device)
     generator.manual_seed(seed)
@@ -139,7 +146,8 @@ def v1_continuous(name, horizon, device, seed, draws):
 def v2_discrete(name, horizon, device, seed, paths):
     env = build_env(name, device)
     algorithm = reference_policy(env, horizon, REFERENCE_STEPS, seed)
-    estimator = DiscreteTransport(env, policy=algorithm.policy, config=DiscreteTransportConfig(horizon=horizon))
+    estimator = DiscreteTransport(env, policy=algorithm.policy, config=DiscreteTransportConfig(
+        horizon=horizon, simplex_sigma=run_plan.TRANSPORT_ALLOCATIONS[name]["simplex_sigma"]))
     generator = torch.Generator(device=env.device)
     generator.manual_seed(seed + 5000)
     # Common random numbers: one bank of perturbation paths reused at every lambda.
@@ -167,7 +175,29 @@ def v2_discrete(name, horizon, device, seed, paths):
 
 
 def v2_continuous(name, horizon, device, seed):
-    return []
+    """Exact |J^lambda - J| and ||grad J^lambda - grad J|| under the transport mean randomizer."""
+    from mfc.environments.randomizers import LawRandomizer
+
+    if name not in CONTINUOUS_EXACT:
+        return []
+    env = build_env(name, device)
+    algorithm = reference_policy(env, horizon, REFERENCE_STEPS, seed)
+    theta = algorithm.policy.detach().clone().requires_grad_(True)
+    randomizer = LawRandomizer(kind="mixture", sigma=1.0)
+    base = env.objective(theta, lambda_=0.0)
+    base_grad = torch.autograd.grad(base, theta)[0]
+    rows = []
+    for lambda_ in LAMBDAS:
+        value = env.objective(theta, lambda_=lambda_, randomizer=randomizer)
+        gradient = torch.autograd.grad(value, theta)[0]
+        objective_gap = abs(float(value - base))
+        gradient_gap = float((gradient - base_grad).norm())
+        rows.append({"benchmark": name, "space": "continuous", "lambda": lambda_,
+                     "objective_gap": objective_gap, "gradient_gap": gradient_gap,
+                     "objective_over_lambda": objective_gap / lambda_,
+                     "gradient_over_lambda": gradient_gap / lambda_,
+                     "objective_over_lambda2": objective_gap / lambda_ ** 2})
+    return rows
 
 
 def main():
@@ -200,7 +230,10 @@ def main():
             print(f"V2 {name} ...", flush=True)
             rows += v2_discrete(name, horizon, args.device, args.seed, args.paths)
         for name, horizon in CONTINUOUS.items():
-            print(f"V2 {name} skipped: no closed-form oracle for mixture transport.", flush=True)
+            if name not in CONTINUOUS_EXACT:
+                print(f"V2 {name} skipped: no closed-form perturbed objective.", flush=True)
+                continue
+            print(f"V2 {name} ...", flush=True)
             rows += v2_continuous(name, horizon, args.device, args.seed)
         table = pd.DataFrame(rows)
         save_table(table, output / "perturbation_consistency.csv")

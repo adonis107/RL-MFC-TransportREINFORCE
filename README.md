@@ -8,6 +8,8 @@ Code for the mean-field control experiments comparing:
 - Transport-Proba REINFORCE, with a likelihood-ratio population-flow sensitivity
   (continuous-state benchmarks only)
 - tabular mean-field Q-learning, on cybersecurity
+- centered finite differences of the objective, on the continuous-state benchmarks,
+  using the shifted systems of the transport auxiliary stage
 
 ## Setup
 
@@ -37,7 +39,9 @@ uv run python scripts/train.py \
 
 Environments are `twostate`, `cybersecurity`, `distribution`, `advertising`, `lq`,
 `portfolio` and `bimodal`. Algorithms are `reinforce`, `mfreinforce`, `transport`,
-`gaussian` and `mfqlearning`.
+`gaussian`, `finitediff` and `mfqlearning`. `finitediff` takes its step as
+`--perturbation`; `--common-random-numbers` drives both systems of a coordinate with
+the same draws.
 
 `bimodal` is the bimodal population allocation benchmark (`T=1`,
 `Theta=[0.75, 0.95]`, initialized at `theta=0.8`). Its terminal law has mean zero
@@ -77,6 +81,12 @@ control also sweeps the radii `n^(-1/4) / 2` and `n^(-1/4)` against the large gr
 
 ## The full suite
 
+Every configuration of the plan, with its settings, budget and command:
+
+```bash
+uv run python scripts/run.py --env all --manifest outputs/run_manifest.csv
+```
+
 ```bash
 scripts/run_suite.sh
 ```
@@ -97,11 +107,10 @@ uv run python scripts/make_outputs.py --results-root results
 ```
 
 The decomposition table recomputes a perturbed optimum per scale, so it has its
-own entry point:
+own entry point, which `run_suite.sh` also calls at the end:
 
 ```bash
-uv run python scripts/decomposition.py lq portfolio --root results \
-  --tex outputs/tables/continuous_decomposition.tex
+uv run python scripts/decomposition.py --root results --tex outputs/tables/decomposition.tex
 ```
 
 ## Diagnostics
@@ -111,6 +120,8 @@ uv run python scripts/verify_randomizers.py   # closed-form J^lambda against sim
 uv run python scripts/verify_gaussian.py      # Transport-Proba score, sensitivities, gradient
 uv run python scripts/verify_bounds.py        # error rates in eta, n, M, lambda and B
 uv run python scripts/verify_discrete_eta.py --compare-batches  # finite-state eta, shared vs fresh batches
+uv run python scripts/verify_discrete_bounds.py --env all       # finite-state rates in n, M, lambda and B
+uv run python scripts/tune_finite_difference.py --independent  # finite-difference step against the oracle
 uv run python scripts/verify_theory.py        # perturbation estimate and consistency
 uv run python scripts/tune_perturbation.py    # auxiliary scales against the gradient oracle
 uv run python scripts/correction_alignment.py # alignment of the transport correction

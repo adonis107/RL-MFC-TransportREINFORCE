@@ -36,11 +36,13 @@ from mfc.visualization.tables import save_table
 
 DISCRETE = ["twostate", "cybersecurity", "distribution", "advertising"]
 
+# Each benchmark is screened at its horizon and at the anchor lambda* = B^(-1/4) of its main grid.
 SETTINGS = {
-    "twostate": {"horizon": 5, "lambda_": 0.1},
-    "cybersecurity": {"horizon": 3, "lambda_": 0.4},
-    "distribution": {"horizon": 5, "lambda_": 0.2},
-    "advertising": {"horizon": 5, "lambda_": 0.2},
+    name: {
+        "horizon": run_plan.TRANSPORT_ALLOCATIONS[name]["horizon"],
+        "lambda_": run_plan.asymptotic_main_lambda(name),
+    }
+    for name in DISCRETE
 }
 
 ETAS = (0.85, 0.95, 0.98)
