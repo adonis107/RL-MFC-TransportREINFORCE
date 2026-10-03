@@ -202,6 +202,7 @@ def run_sweeps(name, args):
     d_theta = policy.numel()
     n_grid = auxiliary_grid(n, d_theta)
     replications_b = args.replications_b or args.replications_g
+    replications_lambda = args.replications_lambda or args.replications_g
 
     print(f"\n===== {name}  T={horizon}  |grad J| = {float(reference.norm()):.6f}")
     print(f"      reference allocation M={M} n={n} B={B}, lambda={lambda_default}, eta={eta_default}")
@@ -251,12 +252,12 @@ def run_sweeps(name, args):
         for scale in LAMBDA_GRID:
             algorithm = build(env, policy, scale, eta_default, "exact", args.large_b, n, M, horizon)
             bias, mse, variance, norm = gradient_statistics(
-                algorithm, reference, args.replications_g, oracle_D=oracle_D
+                algorithm, reference, replications_lambda, oracle_D=oracle_D
             )
             biases.append(bias)
             # A bias is a norm of an R-sample mean, so it cannot be read below
             # about sqrt(var / R); print that resolution next to it.
-            resolution = math.sqrt(variance / args.replications_g)
+            resolution = math.sqrt(variance / replications_lambda)
             record("lambda", "lambda", scale, bias=bias, mse=mse, variance=variance,
                    reference_norm=norm, bias_resolution=resolution)
             print(f"   lambda={scale:<6} bias = {bias:10.5f} +- {resolution:8.5f}"
@@ -316,6 +317,12 @@ def main():
         type=int,
         default=None,
         help="replications for the B sweep, whose bias column needs many more than the rest",
+    )
+    parser.add_argument(
+        "--replications-lambda",
+        type=int,
+        default=None,
+        help="replications for the lambda sweep, whose bias at small lambda is below the resolution of 64",
     )
     parser.add_argument("--large-b", type=int, default=4096)
     parser.add_argument("--output", default="results/figures/bounds")

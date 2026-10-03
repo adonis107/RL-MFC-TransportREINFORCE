@@ -542,6 +542,20 @@ DISPLAY = {
 BENCHMARKS = ["twostate", "distribution", "advertising", "lq", "portfolio", "bimodal"]
 
 
+# AISTATS sets table captions above the table.
+CAPTION = (
+        "\\caption{Two sources of the residual error of each run: the displacement of the value of "
+        "the perturbed problem, $|J^\\lambda(\\theta_\\lambda^\\star)-J(\\theta^\\star)|$, and the error left in "
+        "optimizing it, $|J^\\lambda(\\widehat\\theta_\\lambda)-J^\\lambda(\\theta_\\lambda^\\star)|$. Here "
+        "$\\theta_\\lambda^\\star$ maximizes $J^\\lambda$ in the control class that realizes $\\theta^\\star$, and "
+        "$\\widehat\\theta_\\lambda$ is the parameter the run returns; MF-REINFORCE is taken against its "
+        "own perturbed objective, at scale $\\varepsilon$, and REINFORCE optimizes $J$ itself. The final gap "
+        "is bounded by the sum of both and of $|J(\\widehat\\theta_\\lambda)-J^\\lambda(\\widehat\\theta_\\lambda)|$, "
+        "so the displacement can exceed it. Every quantity is exact given the run; dispersion is over five "
+        "seeds. Cybersecurity has no known optimum.}"
+)
+
+
 def tex_table(collected, path):
     """LaTeX form of the decomposition, every arm of every benchmark."""
     digits = 4
@@ -550,6 +564,8 @@ def tex_table(collected, path):
         "\\centering",
         "\\small",
         "\\setlength{\\tabcolsep}{3.5pt}",
+        CAPTION,
+        "\\label{tab:decomposition}",
         "\\begin{tabular}{llrrrr}",
         "\\toprule",
         "Benchmark & Estimator & Scale & "
@@ -588,14 +604,6 @@ def tex_table(collected, path):
     lines += [
         "\\bottomrule",
         "\\end{tabular}",
-        "\\caption{Residual error of each run, split into the displacement of the perturbed "
-        "optimum and the error left in optimizing it. Here $\\theta_\\lambda^\\star$ maximizes "
-        "$J^\\lambda$ in the control class that realizes $\\theta^\\star$, and "
-        "$\\widehat\\theta_\\lambda$ is the parameter the run returns; MF-REINFORCE is taken against its "
-        "own perturbed objective, at scale $\\varepsilon$. REINFORCE and finite differences optimize $J$ "
-        "itself. Every quantity is exact given the run; dispersion is over five seeds. Cybersecurity has "
-        "no known optimum.}",
-        "\\label{tab:decomposition}",
         "\\end{table}",
         "",
     ]

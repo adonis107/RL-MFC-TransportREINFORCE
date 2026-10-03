@@ -7,8 +7,9 @@ V1, perturbation estimate. In finite state space the perturbed law is
 perturbations the estimator actually uses and print the largest realized ratio d_TV(M, mu)/lambda,
 which says whether lambda is the true total-variation radius or a loose parametrization. In
 continuous state space the reference gives a squared-Wasserstein perturbation estimate whose
-root scales as sqrt(lambda), up to mixture projection error. We compute the one-dimensional W1
-distance from the decoded projected law to its transport perturbation.
+root scales as sqrt(lambda), up to mixture projection error. We compute the one-dimensional W2
+distance from the decoded projected law to its transport perturbation, through quantile functions,
+and the W1 distance beside it.
 
 V2, perturbation consistency. |J^lambda - J| and ||grad J^lambda - grad J|| are bounded by C*lambda.
 Finite-state benchmarks carry an exact population recursion, so for a fixed draw of the perturbation
@@ -120,6 +121,16 @@ def v1_continuous(name, horizon, device, seed, draws):
     generator.manual_seed(seed)
     grid = torch.linspace(-12.0, 12.0, 4001, dtype=env.dtype, device=env.device)
     width = float(grid[1] - grid[0])
+    # Midpoint levels of (0, 1); in one dimension W2^2 is the L2 distance between quantile functions.
+    levels = (torch.arange(4000, dtype=env.dtype, device=env.device) + 0.5) / 4000
+
+    def quantile(distribution):
+        # Linear interpolation of the inverse of a grid CDF.
+        distribution = torch.cummax(distribution, dim=0).values
+        upper = torch.searchsorted(distribution, levels).clamp(1, grid.numel() - 1)
+        left, right = distribution[upper - 1], distribution[upper]
+        share = ((levels - left) / (right - left).clamp_min(1e-15)).clamp(0.0, 1.0)
+        return grid[upper - 1] + share * width
 
     def cdf(z):
         # decode, not unpack: for K = 1 the free weight block is empty and the scales are
@@ -130,16 +141,19 @@ def v1_continuous(name, horizon, device, seed, draws):
 
     rows = []
     for lambda_ in LAMBDAS:
-        squared = []
+        squared_w1, squared_w2 = [], []
         for z in coordinates:
             base = cdf(z)
+            base_quantile = quantile(base)
             randomizers = estimator.sample_transport_randomizers((draws,), generator)
             for randomizer in randomizers:
-                perturbed = estimator.transport_coordinate(z, randomizer, lambda_)
-                squared.append(float(((cdf(perturbed) - base).abs().sum() * width) ** 2))
-        value = (sum(squared) / len(squared)) ** 0.5
+                perturbed = cdf(estimator.transport_coordinate(z, randomizer, lambda_))
+                squared_w1.append(float(((perturbed - base).abs().sum() * width) ** 2))
+                squared_w2.append(float(((quantile(perturbed) - base_quantile) ** 2).mean()))
+        w1 = (sum(squared_w1) / len(squared_w1)) ** 0.5
+        w2 = (sum(squared_w2) / len(squared_w2)) ** 0.5
         rows.append({"benchmark": name, "space": "continuous", "lambda": lambda_,
-                     "w1_rms": value, "max_ratio": value / lambda_ ** 0.5, "holds": True})
+                     "w1_rms": w1, "w2_rms": w2, "max_ratio": w2 / lambda_ ** 0.5, "holds": True})
     return rows
 
 
@@ -206,6 +220,8 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--draws", type=int, default=2000)
+    parser.add_argument("--continuous-draws", type=int, default=200,
+                        help="transport randomizers per time step in the continuous V1 estimate")
     parser.add_argument("--paths", type=int, default=200)
     parser.add_argument("--output-root", default="results/figures/theory")
     args = parser.parse_args()
@@ -218,7 +234,7 @@ def main():
             rows += v1_discrete(name, horizon, args.device, args.seed, args.draws)
         for name, horizon in CONTINUOUS.items():
             print(f"V1 {name} ...", flush=True)
-            rows += v1_continuous(name, horizon, args.device, args.seed, max(args.draws // 100, 20))
+            rows += v1_continuous(name, horizon, args.device, args.seed, args.continuous_draws)
         table = pd.DataFrame(rows)
         save_table(table, output / "perturbation_estimate.csv")
         print("\n=== V1 perturbation estimate ===")

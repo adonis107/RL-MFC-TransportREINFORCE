@@ -4,9 +4,11 @@
 
 Outputs are written under ``outputs/`` by default:
 
-    outputs/figures/theory_verification.pdf
-    outputs/tables/objective_summary.tex
-    outputs/tables/budget_runtime.tex
+    outputs/figures/main_benchmarks.pdf      main text, learning curves and flows
+    outputs/figures/main_diagnostics.pdf     main text, scale trade-off and perturbation results
+    outputs/tables/main_summary.tex          main text, optimality gaps
+    outputs/tables/bounds_exponents_main.tex main text, fitted rates
+    outputs/figures/theory_verification.pdf  appendix, every other figure and table
 """
 
 import argparse
@@ -59,8 +61,7 @@ BENCHMARKS = ["twostate", "cybersecurity", "distribution", "advertising", "lq", 
 # Continuous-state benchmarks carry the mixture chart and the Gaussian-manifold
 # arm; the other groups name the figure each set of benchmarks appears on.
 CONTINUOUS_ENVS = ["lq", "portfolio"]
-MAIN_ENVS = ["distribution", "portfolio", "bimodal"]
-APPENDIX_MAIN_ENVS = ["lq", "twostate"]
+MAIN_ENVS = ["twostate", "distribution", "lq", "portfolio", "bimodal"]
 APPENDIX_ENVS = ["cybersecurity", "advertising"]
 DISPLAY = {
     "twostate": "Two-state",
@@ -103,11 +104,13 @@ METHOD_MARKER = {"REINFORCE": "s", "MF-REINFORCE": "D", "Transport": "o", "Trans
                  "Transport, K=1": "v", "Finite differences": "P"}
 OPTIMAL = "#52514e"
 MFQ_COLOR = "#1baf7a"
-# Every benchmark with a known optimum; cybersecurity has none, so it has no gap to plot.
-TRADEOFF_COLOR = {"lq": "#2a78d6", "portfolio": "#eb6834", "twostate": "#1baf7a", "distribution": "#eda100",
-                  "advertising": "#008300", "bimodal": "#7b3fbf"}
-TRADEOFF_MARKER = {"lq": "o", "portfolio": "s", "twostate": "^", "distribution": "D", "advertising": "v",
-                   "bimodal": "P"}
+# One colour and marker per benchmark, shared by every diagnostic figure.
+ENV_COLOR = {"lq": "#2a78d6", "portfolio": "#eb6834", "bimodal": "#7b3fbf", "twostate": "#1baf7a",
+             "distribution": "#eda100", "cybersecurity": "#e87ba4", "advertising": "#008300"}
+ENV_MARKER = {"lq": "o", "portfolio": "s", "bimodal": "X", "twostate": "^", "distribution": "D",
+              "cybersecurity": "v", "advertising": "P"}
+ENV_SHORT = {"lq": "Linear-quadratic", "portfolio": "Portfolio", "bimodal": "Bimodal", "twostate": "Two-state",
+             "distribution": "Distribution", "cybersecurity": "Cybersecurity", "advertising": "Advertising"}
 GRID, INK, MUTED = "#d8d7d2", "#0b0b0b", "#52514e"
 
 
@@ -364,7 +367,8 @@ def update_budget(env):
     return allocation["horizon"] * run_plan.transport_per_step_budget(env)
 
 
-def draw_learning_panel(ax, results_root, env, legend_only=False, include_gaussian=False, against="updates"):
+def draw_learning_panel(ax, results_root, env, legend_only=False, include_gaussian=False, against="updates",
+                        subtitle=True):
     """Optimality gap against policy updates, or against simulated transitions, for one benchmark."""
     optimum = OPTIMUM_OF[env]
     scale = update_budget(env) / 1e6 if against == "calls" else 1.0
@@ -382,10 +386,11 @@ def draw_learning_panel(ax, results_root, env, legend_only=False, include_gaussi
         ax.fill_between(steps, np.maximum(gap - deviation, floor), gap + deviation,
                         color=METHOD_COLOR[method], alpha=0.20, linewidth=0)
     ax.set_title(TITLE_OF[env].replace("--", "-"), fontsize=8, color=INK, pad=12)
-    ax.text(0.5, 1.015, scale_label(results_root, env, include_gaussian), transform=ax.transAxes,
-            ha="center", va="bottom", fontsize=6.4, color=MUTED)
+    if subtitle:
+        ax.text(0.5, 1.015, scale_label(results_root, env, include_gaussian), transform=ax.transAxes,
+                ha="center", va="bottom", fontsize=6.4, color=MUTED)
     ax.set_yscale("log")
-    ax.set_xlabel("policy updates", fontsize=7.5)
+    ax.set_xlabel("simulated transitions (millions)" if against == "calls" else "policy updates", fontsize=7.5)
     ax.set_ylabel(r"$|J(\theta)-J(\theta^\star)|$", fontsize=7.5)
     style(ax)
     tail = [v for v in panel[max(len(panel) // 20, 1):] if v > 0]
@@ -407,9 +412,8 @@ def figure_legend(figure, axes, order, ncol):
                   ncol=ncol, frameon=False, handlelength=1.8)
 
 
-FLOW_ORDER = (r"$\theta^\star$", "Transport", "Transport, K=1", "Finite differences", "MF-REINFORCE", "REINFORCE")
-# Only the continuous appendix figure carries the Gaussian-manifold arm.
-PROBA_ORDER = (r"$\theta^\star$", "Transport", "Transport-Proba", "Finite differences", "REINFORCE")
+FLOW_ORDER = (r"$\theta^\star$", "Transport", "Transport, K=1", "Transport-Proba", "Finite differences",
+              "MF-REINFORCE", "REINFORCE", r"$\mathcal{N}(0,1)$")
 
 
 def tensor_policy(path):
@@ -574,85 +578,44 @@ FLOW_PANEL = {
 
 
 def main_benchmarks(results_root, output):
-    """Main-text figure: optimality gaps on the top row, induced populations below."""
+    """Main-text figure: optimality gaps on the top row, induced populations below.
+
+    Every panel is read against simulated transitions, the budget the methods of a
+    benchmark share, and the continuous benchmarks carry the Transport-Proba arm.
+    The scales of each run are reported in the summary table, not on the panels.
+    """
     envs = [env for env in MAIN_ENVS if has_run(results_root, env)]
     if not envs:
         print("skipping main_benchmarks: no matching runs found")
         return
-    figure, axes = plt.subplots(2, len(envs), figsize=(5.5, 3.4), constrained_layout=True, squeeze=False)
+    figure, axes = plt.subplots(2, len(envs), figsize=(6.9, 3.15), constrained_layout=True, squeeze=False)
     for index, env in enumerate(envs):
-        draw_learning_panel(axes[0, index], results_root, env, against="calls")
-        axes[0, index].set_xlabel("simulated transitions (millions)", fontsize=7.5)
-        FLOW_PANEL[env](axes[1, index], results_root)
-    axes = axes.ravel()
-    # Three panels across the text width leave no room for the default tick density.
-    titles = [f"{TITLE_OF[env].replace('--', '-')}: optimality gap" for env in envs] + [None] * len(envs)
-    for ax, title in zip(axes, titles):
-        ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=3, steps=[1, 2, 5, 10]))
-        if title is None:
-            title = ax.get_title()
-        ax.set_title(title, fontsize=6.8, color=INK, pad=ax.title.get_position()[1] * 0 + 12)
-        ax.tick_params(labelsize=6.0)
-        ax.xaxis.label.set_size(6.8)
-        ax.yaxis.label.set_size(6.8)
-    figure_legend(figure, axes, FLOW_ORDER, 4)
-    save_figure(figure, output)
-
-
-def appendix_continuous(results_root, output):
-    """Appendix panel: the two continuous benchmarks with the Gaussian-manifold arm.
-
-    This is the only figure that draws Transport-Proba: two panels per benchmark,
-    the optimality gap and the population behaviour it induces, laid out in one
-    row across the text width. The linear-quadratic flow appears only here, the
-    main text having no panel for it.
-    """
-    envs = [env for env in CONTINUOUS_ENVS if has_run(results_root, env)]
-    if not envs:
-        print("skipping appendix_continuous: no matching runs found")
-        return
-
-    panels = [(kind, env) for env in envs for kind in ("gap", "flow")]
-
-    figure, axes = plt.subplots(1, len(panels), figsize=(5.5, 1.8), constrained_layout=True)
-    axes = np.atleast_1d(axes).ravel()
-    # Four across the text width leave no room for full names or for thousands
-    # written out in the update counts.
-    short = {"lq": "Linear-quadratic", "portfolio": "Portfolio"}
-    for ax, (kind, env) in zip(axes, panels):
-        if kind == "gap":
-            draw_learning_panel(ax, results_root, env, include_gaussian=True)
-            title = f"{short[env]}: optimality gap"
+        draw_learning_panel(axes[0, index], results_root, env, include_gaussian=True, against="calls",
+                            subtitle=False)
+        FLOW_PANEL[env](axes[1, index], results_root, include_gaussian=True)
+        axes[0, index].set_title(ENV_SHORT[env], fontsize=7.4, color=INK, pad=4)
+        # The flow panels are identified by their column; keep only what they show.
+        axes[1, index].set_title(axes[1, index].get_title().split(": ", 1)[-1], fontsize=6.8, color=MUTED, pad=3)
+    for env in ("lq", "twostate"):
+        if env in envs:
             # Gaps spanning three decades collide under the shared (1, 2, 5) locator.
-            ax.yaxis.set_major_locator(matplotlib.ticker.LogLocator(base=10.0, numticks=5))
-            ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(thousands_tick))
-        else:
-            FLOW_PANEL[env](ax, results_root, include_gaussian=True)
-            title = ax.get_title().replace("mean wealth flow", "wealth flow")
-        ax.set_title(title, fontsize=6.2, color=INK, pad=12)
+            axes[0, envs.index(env)].yaxis.set_major_locator(matplotlib.ticker.LogLocator(base=10.0, numticks=5))
+    if "bimodal" in envs:
+        # The K=2 gap reaches 1e-4, so the default tail-based limits cut it off.
+        ax = axes[0, envs.index("bimodal")]
+        ax.set_ylim(3e-5, 0.4)
+        ax.yaxis.set_major_locator(matplotlib.ticker.LogLocator(base=10.0, numticks=6))
+    for ax in axes.ravel():
         ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(nbins=3, steps=[1, 2, 5, 10]))
         ax.tick_params(labelsize=5.8)
-        ax.xaxis.label.set_size(6.4)
+        ax.xaxis.label.set_size(6.2)
         ax.yaxis.label.set_size(6.4)
-    figure_legend(figure, axes, PROBA_ORDER, 4)
-    save_figure(figure, output)
-
-
-def appendix_finite(results_root, output):
-    """Appendix panel: the two benchmarks moved out of the main text."""
-    envs = [env for env in APPENDIX_MAIN_ENVS if has_run(results_root, env)]
-    if not envs:
-        print("skipping appendix_finite: no matching runs found")
-        return
-    flows = [env for env in envs if env in FLOW_PANEL]
-    figure, axes = plt.subplots(1, len(envs) + len(flows), figsize=(2.3 * (len(envs) + len(flows)), 2.1),
-                                constrained_layout=True)
-    axes = np.atleast_1d(axes).ravel()
-    for ax, env in zip(axes, envs):
-        draw_learning_panel(ax, results_root, env)
-    for ax, env in zip(axes[len(envs):], flows):
-        FLOW_PANEL[env](ax, results_root)
-    figure_legend(figure, axes, FLOW_ORDER, 4)
+    for ax in axes[0, 1:]:
+        ax.set_ylabel("")
+    axes[0, len(envs) // 2].set_xlabel("simulated transitions (millions)", fontsize=6.2)
+    for ax in np.delete(axes[0], len(envs) // 2):
+        ax.set_xlabel("")
+    figure_legend(figure, axes.ravel(), FLOW_ORDER, 8)
     save_figure(figure, output)
 
 
@@ -693,7 +656,7 @@ def appendix_benchmarks(results_root, output):
             seeds = curves(env_dir(results_root, env), stem)
             if seeds is None:
                 continue
-            steps = np.arange(1, seeds.shape[1] + 1) * 10
+            steps = np.arange(1, seeds.shape[1] + 1) * 10 * update_budget(env) / 1e6
             mean, deviation = seeds.mean(axis=0), seeds.std(axis=0)
             ax.plot(steps, mean, color=METHOD_COLOR[method], linewidth=1.1, label=method)
             ax.fill_between(steps, mean - deviation, mean + deviation,
@@ -709,7 +672,7 @@ def appendix_benchmarks(results_root, output):
         ax.set_title(DISPLAY[env].replace("--", "-"), fontsize=8, color=INK, pad=12)
         ax.text(0.5, 1.015, scale_label(results_root, env), transform=ax.transAxes,
                 ha="center", va="bottom", fontsize=6.4, color=MUTED)
-        ax.set_xlabel("policy updates", fontsize=7.5)
+        ax.set_xlabel("simulated transitions (millions)", fontsize=7.5)
         ax.set_ylabel(r"$J(\theta)$", fontsize=7.5)
         style(ax)
 
@@ -793,42 +756,146 @@ def lambda_sweep(results_root, env, filter_text, flow, horizon, optimum):
     return points
 
 
-def lambda_tradeoff(results_root, output):
-    figure, ax = plt.subplots(figsize=(3.6, 2.5), constrained_layout=True)
+# The bimodal sweep spans two decades of gap, which flattens every other curve; its
+# scales are reported in their own table.
+TRADEOFF_ENVS = ("twostate", "distribution", "lq", "portfolio")
+
+
+def draw_lambda_tradeoff(ax, results_root, envs=TRADEOFF_ENVS):
+    """Final optimality gap of every transport lambda, relative to the best lambda."""
     drawn = 0
-    for title, (env, optimum) in LEARNING_PANELS.items():
-        if env not in TRADEOFF_COLOR:
-            continue
+    for env in envs:
         horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
-        points = lambda_sweep(results_root, env, tradeoff_filter(env), MAIN_FLOW[env], horizon, optimum)
+        points = lambda_sweep(results_root, env, tradeoff_filter(env), MAIN_FLOW[env], horizon, OPTIMUM_OF[env])
         if len(points) < 2:
             print(f"skipping {env} in lambda_tradeoff: fewer than two scales available")
             continue
         scales = sorted(points)
         gaps = [sum(points[s]) / len(points[s]) for s in scales]
         best = min(gaps)
-        colour = TRADEOFF_COLOR[env]
-        ax.plot(scales, [g / best for g in gaps], color=colour, marker=TRADEOFF_MARKER[env],
-                markersize=3.4, linewidth=1.1, label=title.replace("--", "\u2013"))
+        # On the B^{-1/4} multiplier grid the anchor scale is the fourth point.
+        ax.plot([s / run_plan.asymptotic_main_lambda(env) for s in scales], [g / best for g in gaps],
+                color=ENV_COLOR[env], marker=ENV_MARKER[env], markersize=3.2, linewidth=1.1, label=ENV_SHORT[env])
         drawn += 1
-    if not drawn:
-        print("skipping lambda_tradeoff: no sweeps found")
-        return
     ax.axhline(1.0, color=MUTED, linewidth=0.7, dashes=(1.2, 1.6), zorder=1)
+    ax.axvline(1.0, color=MUTED, linewidth=0.7, dashes=(1.2, 1.6), zorder=1)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"$\lambda/\lambda_\star$")
+    ax.set_ylabel("optimality gap / best gap")
+    ticks = [0.125, 0.25, 0.5, 1, 2]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(["1/8", "1/4", "1/2", "1", "2"])
+    ax.tick_params(axis="x", which="minor", length=0)
+    ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(compact_tick))
+    ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    style(ax)
+    return drawn
+
+
+THEORY_TICKS = [0.0125, 0.05, 0.2]
+
+
+def _theory_axis(ax, ylabel, title):
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel(r"$\lambda$")
-    ax.set_ylabel("optimality gap / best gap")
-    style(ax)
-    # Explicit decade-free ticks: the default log locator collides on this narrow range.
-    ticks = [0.01, 0.03, 0.1, 0.3]
-    ax.set_xticks(ticks)
-    ax.set_xticklabels([f"{t:g}" for t in ticks])
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=8, color=INK, pad=4)
+    ax.set_xticks(THEORY_TICKS)
+    ax.set_xticklabels([f"{tick:g}" for tick in THEORY_TICKS])
     ax.tick_params(axis="x", which="minor", length=0)
     ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
-    ax.set_ylim(0.75, ax.get_ylim()[1] * 2.2)
-    ax.legend(frameon=False, fontsize=6.6, handlelength=1.6, loc="upper left", ncol=2,
-              columnspacing=1.0, borderaxespad=0.2)
+    style(ax)
+
+
+def _slope_guides(ax, lambdas, exponents):
+    """Grey reference lines of the given slopes, through the lower left of the panel."""
+    lambdas = np.array(sorted(lambdas), float)
+    low, _ = ax.get_ylim()
+    for exponent, dashes in zip(exponents, ((3, 2), (1, 1.6))):
+        ax.plot(lambdas, low * 2.0 * (lambdas / lambdas[0]) ** exponent, color=MUTED, linewidth=0.8,
+                dashes=dashes, zorder=1, label={1.0: r"$\propto\lambda$", 0.5: r"$\propto\sqrt{\lambda}$"}[exponent])
+
+
+def draw_perturbation_estimate(ax, estimate_csv, envs):
+    """Distance from the perturbed to the unperturbed law, against lambda.
+
+    Finite state space: the largest realized d_TV, whose pathwise bound is lambda.
+    Continuous state space: the root-mean-square W2 distance of the decoded mixtures,
+    whose bound is sqrt(lambda) up to the projection error.
+    """
+    estimate = pd.read_csv(estimate_csv)
+    continuous = estimate["w2_rms"] if "w2_rms" in estimate else estimate["w1_rms"]
+    estimate = estimate.assign(deviation=estimate["max_tv"].where(estimate["space"] == "finite", continuous))
+    for name in envs:
+        rows = estimate[estimate["benchmark"] == name].sort_values("lambda")
+        if rows.empty:
+            continue
+        dashes = (None, None) if rows["space"].iloc[0] == "finite" else (3.5, 1.8)
+        ax.plot(rows["lambda"], rows["deviation"], color=ENV_COLOR[name], marker=ENV_MARKER[name],
+                markersize=3.0, linewidth=1.1, dashes=dashes, label=ENV_SHORT[name])
+    _theory_axis(ax, r"$d_{\mathrm{TV}}$  or  $\mathcal{W}_2$", "perturbation estimate")
+    _slope_guides(ax, estimate["lambda"].unique(), (1.0, 0.5))
+
+
+def draw_perturbation_consistency(ax, consistency_csv, envs):
+    consistency = pd.read_csv(consistency_csv)
+    for name in envs:
+        rows = consistency[consistency["benchmark"] == name].sort_values("lambda")
+        if rows.empty:
+            continue
+        dashes = (None, None) if rows["space"].iloc[0] == "finite" else (3.5, 1.8)
+        ax.plot(rows["lambda"], rows["gradient_gap"], color=ENV_COLOR[name], marker=ENV_MARKER[name],
+                markersize=3.0, linewidth=1.1, dashes=dashes, label=ENV_SHORT[name])
+    _theory_axis(ax, r"$\|\nabla_\theta J^\lambda-\nabla_\theta J\|$", "perturbation consistency")
+    _slope_guides(ax, consistency["lambda"].unique(), (1.0,))
+
+
+def _benchmark_legend(figure, axes, envs, ncol):
+    found = {}
+    for ax in axes:
+        for handle, label in zip(*ax.get_legend_handles_labels()):
+            found.setdefault(label, handle)
+    names = [ENV_SHORT[env] for env in envs if ENV_SHORT[env] in found]
+    names += [name for name in found if name.startswith("$")]
+    figure.legend([found[name] for name in names], names, loc="outside lower center", ncol=ncol,
+                  frameon=False, handlelength=1.8, columnspacing=1.0, borderpad=0.2)
+
+
+def main_diagnostics(results_root, estimate_csv, consistency_csv, output):
+    """Main-text figure: lambda trade-off in training, then the two perturbation results."""
+    if not Path(estimate_csv).exists() or not Path(consistency_csv).exists():
+        print("skipping main_diagnostics: diagnostic CSVs not found")
+        return
+    figure, axes = plt.subplots(1, 3, figsize=(6.9, 2.15), constrained_layout=True)
+    draw_lambda_tradeoff(axes[0], results_root)
+    axes[0].set_title("(a) scale in training", fontsize=8, color=INK, pad=4)
+    draw_perturbation_estimate(axes[1], estimate_csv, MAIN_ENVS)
+    axes[1].set_title("(b) " + axes[1].get_title(), fontsize=8, color=INK, pad=4)
+    draw_perturbation_consistency(axes[2], consistency_csv, MAIN_ENVS)
+    axes[2].set_title("(c) " + axes[2].get_title(), fontsize=8, color=INK, pad=4)
+    for ax in axes:
+        ax.tick_params(labelsize=6.2)
+        ax.xaxis.label.set_size(7.0)
+        ax.yaxis.label.set_size(7.0)
+    _benchmark_legend(figure, axes, MAIN_ENVS, 7)
+    save_figure(figure, output)
+
+
+def theory_verification(estimate_csv, consistency_csv, output):
+    """Appendix figure: the two perturbation results on every benchmark."""
+    if not Path(estimate_csv).exists() or not Path(consistency_csv).exists():
+        print("skipping theory_verification: diagnostic CSVs not found")
+        return
+    order = ["lq", "portfolio", "bimodal", "twostate", "distribution", "cybersecurity", "advertising"]
+    figure, axes = plt.subplots(1, 2, figsize=(5.5, 2.35), constrained_layout=True)
+    draw_perturbation_estimate(axes[0], estimate_csv, order)
+    axes[0].set_title("(a) perturbation estimate", fontsize=8, color=INK, pad=4)
+    draw_perturbation_consistency(axes[1], consistency_csv, order)
+    axes[1].set_title("(b) perturbation consistency", fontsize=8, color=INK, pad=4)
+    _benchmark_legend(figure, axes, order, 5)
     save_figure(figure, output)
 
 
@@ -956,71 +1023,27 @@ def twostate_eta_sweep(results_root, output):
     save_figure(figure, output)
 
 
-def theory_verification(estimate_csv, consistency_csv, output):
-    if not Path(estimate_csv).exists() or not Path(consistency_csv).exists():
-        print("skipping theory_verification: diagnostic CSVs not found")
-        return
-
-    display = {"twostate": "Two-state", "cybersecurity": "Cybersecurity", "distribution": "Distribution",
-               "advertising": "Advertising", "lq": "Linear-quadratic", "portfolio": "Portfolio",
-               "bimodal": "Bimodal"}
-    order = ["lq", "portfolio", "bimodal", "twostate", "distribution", "cybersecurity", "advertising"]
-    color = dict(zip(order, ["#2a78d6", "#eb6834", "#7b3fbf", "#1baf7a", "#eda100", "#e87ba4", "#008300"]))
-    marker = dict(zip(order, ["o", "s", "X", "^", "D", "v", "P"]))
-    ticks = [0.0125, 0.025, 0.05, 0.1, 0.2, 0.4]
-
-    estimate = pd.read_csv(estimate_csv)
-    consistency = pd.read_csv(consistency_csv)
-    figure, axes = plt.subplots(1, 2, figsize=(5.5, 2.35), constrained_layout=True)
-    # Both state spaces are divided by lambda, so a flat line means the deviation is
-    # proportional to lambda whichever metric it is measured in. The finite-state bound is
-    # lambda and is attained; the continuous-state bound is only sqrt(lambda), so a flat
-    # continuous line means the measured deviation is of lower order than guaranteed.
-    deviation = estimate["max_tv"].where(estimate["space"] == "finite", estimate["w1_rms"])
-    estimate = estimate.assign(deviation_over_lambda=deviation / estimate["lambda"])
-    for name in order:
-        rows = estimate[estimate["benchmark"] == name].sort_values("lambda")
-        if rows.empty:
-            continue
-        dashes = (None, None) if rows["space"].iloc[0] == "finite" else (3.5, 1.8)
-        axes[0].plot(rows["lambda"], rows["deviation_over_lambda"], color=color[name], marker=marker[name],
-                     markersize=3.2, linewidth=1.1, dashes=dashes, label=display[name])
-    axes[0].set_xscale("log")
-    axes[0].set_ylim(0.0, max(3.2, float(estimate["deviation_over_lambda"].max()) * 1.15))
-    axes[0].set_xlabel(r"$\lambda$")
-    axes[0].set_ylabel(r"$d_{\mathrm{TV}}/\lambda$   or   $\mathcal{W}_2/\lambda$")
-    axes[0].set_title("(a) perturbation estimate", fontsize=8, color=INK, pad=4)
-
-    for name in order:
-        rows = consistency[consistency["benchmark"] == name].sort_values("lambda")
-        if rows.empty:
-            continue
-        dashes = (None, None) if rows["space"].iloc[0] == "finite" else (3.5, 1.8)
-        axes[1].plot(rows["lambda"], rows["gradient_over_lambda"], color=color[name], marker=marker[name],
-                     markersize=3.2, linewidth=1.1, dashes=dashes, label=display[name])
-    axes[1].set_xscale("log")
-    axes[1].set_yscale("log")
-    axes[1].set_xlabel(r"$\lambda$")
-    axes[1].set_ylabel(r"$\|\nabla_\theta J^\lambda-\nabla_\theta J\|\,/\,\lambda$")
-    axes[1].set_title("(b) perturbation consistency", fontsize=8, color=INK, pad=4)
-
-    for ax in axes:
-        ax.set_xticks(ticks)
-        ax.set_xticklabels([f"{tick:g}" for tick in ticks])
-        ax.tick_params(axis="x", which="minor", length=0)
-        ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
-        style(ax)
-    handles, labels = axes[0].get_legend_handles_labels()
-    figure.legend(handles, labels, loc="outside lower center", ncol=4, frameon=False,
-                  handlelength=1.8, columnspacing=1.0, borderpad=0.2)
-    save_figure(figure, output)
-
-
-BOUND_COLOR = {"lq": "#2a78d6", "portfolio": "#eb6834", "twostate": "#1baf7a", "cybersecurity": "#e87ba4",
-               "distribution": "#eda100", "advertising": "#008300"}
-BOUND_MARKER = {"lq": "o", "portfolio": "s", "twostate": "^", "cybersecurity": "v", "distribution": "D",
-                "advertising": "P"}
+BOUND_COLOR, BOUND_MARKER = ENV_COLOR, ENV_MARKER
 BOUND_ENVS = ("lq", "portfolio", "twostate", "cybersecurity", "distribution", "advertising")
+# The bimodal benchmark has a scalar parameter and T=1, and is not swept.
+MAIN_BOUND_ENVS = ("twostate", "distribution", "lq", "portfolio")
+
+
+def lambda_fit_mask(block):
+    """Points of a lambda sweep on which its exponent is fitted.
+
+    A bias is the norm of a sample mean, so it is not read below about twice its
+    Monte Carlo resolution; the finite sweeps are exact and keep every point. Of the
+    points left, the lower half is kept, since the bias saturates once it is of the
+    order of the gradient itself.
+    """
+    values = block["value"].to_numpy(float)
+    keep = np.ones_like(values, dtype=bool)
+    if "bias_resolution" in block and block["bias_resolution"].notna().any():
+        keep = block["bias"].to_numpy(float) >= 2.0 * block["bias_resolution"].to_numpy(float)
+    if keep.sum() > 2:
+        keep &= values <= np.median(values[keep])
+    return keep
 
 
 def load_bounds(bounds_csv):
@@ -1129,10 +1152,15 @@ def bounds_rates(bounds_csv, output, envs=("lq", "portfolio")):
                 continue
             x, y = block["value"].to_numpy(), block[field].to_numpy()
             ax.plot(x, y, color=BOUND_COLOR[env], marker=BOUND_MARKER[env], markersize=3.0, linewidth=1.1)
-            guide(ax, x, y, exponent)
-            # The scale sweep saturates at its top, so its exponent is fitted on
-            # the lower half of the grid, as in the table.
-            keep = x <= np.median(x) if sweep == "lambda" else np.ones_like(x, dtype=bool)
+            keep = lambda_fit_mask(block) if sweep == "lambda" else np.ones_like(x, dtype=bool)
+            if sweep == "lambda" and "bias_resolution" in block and block["bias_resolution"].notna().any():
+                # Monte Carlo resolution of the bias; hollow markers are not fitted.
+                ax.errorbar(x, y, yerr=block["bias_resolution"].to_numpy(), fmt="none",
+                            ecolor=BOUND_COLOR[env], elinewidth=0.6, capsize=1.5)
+                ax.plot(x[~keep], y[~keep], linestyle="none", marker=BOUND_MARKER[env], markersize=3.0,
+                        markerfacecolor="white", markeredgecolor=BOUND_COLOR[env])
+            anchor = int(np.flatnonzero(keep)[0]) if keep.any() else 0
+            guide(ax, x, y, exponent, anchor=anchor)
             _annotate_slope(ax, x, y, exponent, fitted=bound_slope(x[keep], y[keep]))
             _finish(ax, xlabel, ylabel, DISPLAY[env].replace("--", "-") if column == 0 else None)
     save_figure(figure, output)
@@ -1147,9 +1175,9 @@ BOUND_SWEEPS = [
 ]
 
 
-def bounds_exponents(bounds_csv):
+def bounds_exponents(bounds_csv, envs=BOUND_ENVS, label="tab:bounds-exponents", wide=False):
     """Fitted log-log exponents of every sweep against the rate the bound predicts."""
-    table, envs = _bounds_table(bounds_csv)
+    table, envs = _bounds_table(bounds_csv, envs)
     if table is None:
         return None
     header = " & ".join(["Quantity", "Swept"] + [DISPLAY[env] for env in envs] + ["$p_0$"])
@@ -1161,17 +1189,17 @@ def bounds_exponents(bounds_csv):
             if sweep == "B" and not rows.empty:
                 rows = rows[rows["lambda_"] == rows["lambda_"].min()]
             if sweep == "lambda" and not rows.empty:
-                rows = rows[rows["value"] <= rows["value"].median()]
+                rows = rows[lambda_fit_mask(rows)]
             cells.append("---" if rows.empty else f"${bound_slope(rows['value'], rows[column]):+.2f}$")
         lines.append(" & ".join([quantity, knob] + cells + [f"${exponent:+.0f}$"]) + " \\\\")
     caption = (
         "Slope $p$ of each error against the quantity swept, fitted by least squares on a log-log "
         "scale, at $\\theta=\\tfrac12\\theta^\\star$ on the continuous benchmarks and at the initial "
         "policy on the finite ones, with $p_0$ the slope of the mechanism producing it. The $\\lambda$ "
-        "row is fitted on the lower half of its grid."
+        "row is fitted on the lower half of the scales whose bias exceeds twice its Monte Carlo resolution."
     )
-    return table_environment("\n".join(lines), caption, "tab:bounds-exponents",
-                             "ll" + "r" * len(envs) + "r", size="\\small")
+    return table_environment("\n".join(lines), caption, label,
+                             "ll" + "r" * len(envs) + "r", size="\\footnotesize", wide=wide, tabcolsep="4pt")
 
 
 def method_of(label):
@@ -1198,20 +1226,24 @@ def with_error(row, digits=4):
     return f"${number(row['mean'], digits)}\\pm{number(row['std'], digits)}$"
 
 
-def table_environment(body, caption, label, alignment, size=None):
+def table_environment(body, caption, label, alignment, size=None, wide=False, tabcolsep=None):
+    """A booktabs table; wide tables span both columns of the main text."""
+    begin, end = ("\\begin{table*}[t]", "\\end{table*}") if wide else ("\\begin{table}[H]", "\\end{table}")
     return "\n".join(
         [
-            "\\begin{table}[H]",
+            begin,
             "\\centering",
             *([size] if size else []),
+            *([f"\\setlength{{\\tabcolsep}}{{{tabcolsep}}}"] if tabcolsep else []),
+            # AISTATS sets table captions above the table.
+            f"\\caption{{{caption}}}",
+            f"\\label{{{label}}}",
             f"\\begin{{tabular}}{{{alignment}}}",
             "\\toprule",
             body,
             "\\bottomrule",
             "\\end{tabular}",
-            f"\\caption{{{caption}}}",
-            f"\\label{{{label}}}",
-            "\\end{table}",
+            end,
             "",
         ]
     )
@@ -1257,12 +1289,14 @@ def reference_optimum(results_root, env):
 
 
 def objective_summary(results_root):
+    envs = [name for name in BENCHMARKS if has_run(results_root, name)]
+    finite_differences = any(finite_difference_stem(results_root, env) for env in envs)
     lines = [
-        "Benchmark & Optimum & REINFORCE & MF-REINFORCE & Transport & $(\\lambda,\\eta)$ "
-        "& Transport-Proba & $\\lambda$ & Finite diff. \\\\",
+        "Benchmark & $T$ & Optimum & REINFORCE & MF-REINFORCE & Transport & $(\\lambda,\\eta)$"
+        + (" & Finite diff." if finite_differences else "") + " \\\\",
         "\\midrule",
     ]
-    for env in [name for name in BENCHMARKS if has_run(results_root, name)]:
+    for env in envs:
         grouped, _ = grouped_objectives(results_root, env)
         best = select_headline(grouped, env)
         optimum = reference_optimum(results_root, env)
@@ -1277,31 +1311,28 @@ def objective_summary(results_root):
             if transport is None or lambda_ is None or eta is None
             else f"$({lambda_:g},{eta:g})$"
         )
-        gaussian = best.get("gaussian")
-        proba_lambda, _ = transport_scales(gaussian_stem(results_root, env))
-        proba_scale = "---" if gaussian is None or proba_lambda is None else f"${proba_lambda:g}$"
         lines.append(
             " & ".join(
                 [
-                    f"{DISPLAY[env]} ($T={run_plan.TRANSPORT_ALLOCATIONS[env]['horizon']}$)",
+                    DISPLAY[env],
+                    str(run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]),
                     "---" if optimum is None else f"${number(optimum, digits)}$",
                     with_error(best.get("reinforce"), digits),
                     with_error(best.get("mfreinforce"), digits),
                     with_error(transport, digits),
                     scales,
-                    with_error(gaussian, digits),
-                    proba_scale,
-                    with_error(best.get("finitediff"), digits),
-                ]
+                ] + ([with_error(best.get("finitediff"), digits)] if finite_differences else [])
             )
             + " \\\\"
         )
     caption = (
         "Final validation objective on every benchmark, as mean and standard deviation over seeds. "
-        "Higher is better. The transport column shows the best fixed-scale run among the bound-scale "
-        "multipliers and the asymptotic anchor scales used for the benchmark."
+        "Higher is better. The transport column shows the best run of the scale grid; every scale of "
+        "Transport and Transport-Proba on the continuous benchmarks is in Table~\\ref{tab:continuous-comparison}."
     )
-    return table_environment("\n".join(lines), caption, "tab:objective-summary", "lrrrrlrlr", size="\\small")
+    alignment = "lrrrrrl" + ("r" if finite_differences else "")
+    return table_environment("\n".join(lines), caption, "tab:objective-summary", alignment, size="\\footnotesize",
+                             tabcolsep="4pt")
 
 
 ESTIMATORS = [
@@ -1364,19 +1395,6 @@ def budget_runtime(results_root):
         "Simulator budget and wall-clock cost per run at the headline configuration. "
         "Budgets are matched by construction; wall clock also reflects estimator arithmetic.",
         "tab:budget-runtime",
-    )
-
-
-def continuous_runtime(results_root):
-    return runtime_summary(
-        results_root,
-        CONTINUOUS_ENVS,
-        True,
-        "Simulator budget per policy update and wall-clock cost of one run, as a mean over "
-        "seeds. Budgets are matched by construction; wall clock also reflects estimator "
-        "arithmetic. The scales column counts the perturbation hyperparameters each estimator "
-        "carries.",
-        "tab:continuous-runtime",
     )
 
 
@@ -1531,6 +1549,98 @@ def bimodal_components(results_root):
     return table_environment("\n".join(lines), caption, "tab:bimodal-components", "lrrrr", size="\\small")
 
 
+MULTIPLIER = {0.125: "1/8", 0.25: "1/4", 0.5: "1/2", 1.0: "1", 2.0: "2"}
+
+
+def significant(mean, deviation, digits=3):
+    """Mean and deviation to the same decimal place, with three significant figures in the mean."""
+    decimals = max(0, digits - 1 - int(np.floor(np.log10(abs(mean))))) if mean else digits
+    return f"{mean:.{decimals}f}\\pm{deviation:.{decimals}f}"
+
+
+def multiplier(scale, anchor):
+    ratio = scale / anchor
+    closest = min(MULTIPLIER, key=lambda value: abs(np.log(ratio / value)))
+    return MULTIPLIER[closest] if abs(np.log(ratio / closest)) < 0.05 else f"{ratio:.2g}"
+
+
+def main_summary(results_root):
+    """Main-text table: final optimality gap of every method on the main benchmarks.
+
+    Transport is reported at the anchor scale lambda_star = B^{-1/4} and at the best
+    scale of its grid, Transport-Proba at the best scale of the same grid; the
+    smallest gap of each row is set in bold.
+    """
+    lines = [
+        "& & & & \\multicolumn{2}{c}{Transport} & Transport-Proba \\\\",
+        "\\cmidrule(lr){5-6}\\cmidrule(lr){7-7}",
+        "Benchmark & $J(\\theta^\\star)$ & REINFORCE & MF-REINFORCE & at $\\lambda_\\star$ & best ($\\lambda$) "
+        "& best ($\\lambda$) \\\\",
+        "\\midrule",
+    ]
+    etas = []
+    for env in [name for name in MAIN_ENVS if has_run(results_root, name)]:
+        horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
+        anchor = run_plan.asymptotic_main_lambda(env)
+        stems = run_stems(results_root, env)
+        cells = {}
+        for method in ("REINFORCE", "MF-REINFORCE"):
+            if method in stems:
+                gaps = seed_gaps(results_root, env, stems[method])
+                if gaps.size:
+                    cells[method] = (gaps.mean(), gaps.std(ddof=1))
+        sweep = lambda_sweep(results_root, env, tradeoff_filter(env), MAIN_FLOW[env], horizon, OPTIMUM_OF[env])
+        sweep = {scale: np.array(gaps) for scale, gaps in sweep.items()}
+        if sweep:
+            at_anchor = sweep[min(sweep, key=lambda scale: abs(np.log(scale / anchor)))]
+            cells["anchor"] = (at_anchor.mean(), at_anchor.std(ddof=1))
+            best = min(sweep, key=lambda scale: sweep[scale].mean())
+            cells["best"] = (sweep[best].mean(), sweep[best].std(ddof=1))
+        proba = {}
+        if env in CONTINUOUS_ENVS:
+            for scale in scale_grid(results_root, env, "gaussian"):
+                gaps = seed_gaps(results_root, env, f"gaussian_lambda_{scale:g}_T_{horizon}_particle")
+                if gaps.size:
+                    proba[scale] = gaps
+        proba_best = min(proba, key=lambda scale: proba[scale].mean()) if proba else None
+        if proba_best is not None:
+            cells["proba"] = (proba[proba_best].mean(), proba[proba_best].std(ddof=1))
+        winner = min(cells, key=lambda key: cells[key][0])
+
+        def cell(key, scale=None):
+            if key not in cells:
+                return "---"
+            text = significant(*cells[key])
+            text = f"$\\mathbf{{{text}}}$" if key == winner else f"${text}$"
+            if scale is not None:
+                ratio = multiplier(scale, anchor)
+                written = {"1": "\\lambda_\\star", "2": "2\\lambda_\\star"}.get(
+                    ratio, f"\\lambda_\\star/{ratio[2:]}" if ratio.startswith("1/") else f"{ratio}\\lambda_\\star")
+                text += f" {{\\scriptsize$({written})$}}"
+            return text
+
+        name = "Bimodal ($K=2$)" if env == "bimodal" else DISPLAY[env]
+        lines.append(" & ".join([
+            name,
+            f"${OPTIMUM_OF[env]:.4g}$".replace("$-0$", "$0$"),
+            cell("REINFORCE"),
+            cell("MF-REINFORCE"),
+            cell("anchor"),
+            cell("best", best if sweep else None),
+            cell("proba", proba_best),
+        ]) + " \\\\")
+        etas.append(f"{DISPLAY[env].lower()} ${run_plan.auxiliary_eta(env):g}$")
+    caption = (
+        "Final optimality gap $|J(\\widehat\\theta)-J(\\theta^\\star)|$ on the main benchmarks, as mean and "
+        "standard deviation over five paired seeds at matched simulator budgets; lower is better and the "
+        "smallest gap of each row is in bold. Transport is trained on the grid "
+        "$\\lambda\\in\\lambda_\\star\\{1/8,1/4,1/2,1,2\\}$, with $\\lambda_\\star=B^{-1/4}$, and Transport-Proba on "
+        "the same grid; the scale of each best run is in parentheses. The auxiliary radius is fixed before training: $\\eta=$ " + ", ".join(etas) + "."
+    )
+    return table_environment("\n".join(lines), caption, "tab:main-summary", "lrrrrrr", size="\\footnotesize",
+                             wide=True, tabcolsep="4pt")
+
+
 def headline_row(rows, results_root, env, algorithm):
     """The runtime row of the configuration the objective tables report.
 
@@ -1614,10 +1724,10 @@ def main():
                          "mathtext.fontset": "stix", "axes.labelsize": 8, "legend.fontsize": 7.2})
 
     main_benchmarks(results_root, figures / "main_benchmarks.pdf")
-    appendix_finite(results_root, figures / "appendix_finite.pdf")
-    appendix_continuous(results_root, figures / "appendix_continuous.pdf")
+    main_diagnostics(results_root, ROOT / args.theory_estimate, ROOT / args.theory_consistency,
+                     figures / "main_diagnostics.pdf")
+    write_table(main_summary(results_root), tables / "main_summary.tex")
     appendix_benchmarks(results_root, figures / "appendix_benchmarks.pdf")
-    lambda_tradeoff(results_root, figures / "lambda_tradeoff.pdf")
     discrete_eta(ROOT / args.discrete_eta, figures / "discrete_eta.pdf")
     twostate_eta_sweep(results_root, figures / "twostate_eta_sweep.pdf")
     eta_table = discrete_eta_table(ROOT / args.discrete_eta)
@@ -1634,8 +1744,10 @@ def main():
     exponents = bounds_exponents(ROOT / args.bounds)
     if exponents is not None:
         write_table(exponents, tables / "bounds_exponents.tex")
+    exponents = bounds_exponents(ROOT / args.bounds, MAIN_BOUND_ENVS, "tab:bounds-exponents-main", wide=True)
+    if exponents is not None:
+        write_table(exponents, tables / "bounds_exponents_main.tex")
     write_table(continuous_comparison(results_root), tables / "continuous_comparison.tex")
-    write_table(continuous_runtime(results_root), tables / "continuous_runtime.tex")
     bimodal = bimodal_components(results_root)
     if bimodal is not None:
         write_table(bimodal, tables / "bimodal_components.tex")
