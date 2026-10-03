@@ -794,6 +794,20 @@ def draw_lambda_tradeoff(ax, results_root, envs=TRADEOFF_ENVS):
     return drawn
 
 
+def lambda_tradeoff(results_root, output):
+    """Main-text figure, one column: the lambda trade-off in training on its own."""
+    figure, ax = plt.subplots(figsize=(3.25, 2.0), constrained_layout=True)
+    if not draw_lambda_tradeoff(ax, results_root):
+        print("skipping lambda_tradeoff: no matching runs found")
+        plt.close(figure)
+        return
+    ax.tick_params(labelsize=6.2)
+    ax.xaxis.label.set_size(7.0)
+    ax.yaxis.label.set_size(7.0)
+    ax.legend(frameon=False, fontsize=6.2, loc="upper left")
+    save_figure(figure, output)
+
+
 THEORY_TICKS = [0.0125, 0.05, 0.2]
 
 
@@ -1114,9 +1128,10 @@ def bounds_radius(bounds_csv, output):
                 markersize=3.0, linewidth=1.1, label=r"$\mathbb{E}\|\widehat D-D\|^2$")
         ax.plot(taylor["value"], taylor["error"], color=OPTIMAL, marker="^", markersize=3.0,
                 linewidth=1.1, dashes=(3, 2), label=r"$\|D_\eta-D\|^2$")
-        auxiliary = verify_bounds.BENCHMARKS[env][5]
-        ax.axvline(auxiliary ** (-1 / 6), color=MUTED, linewidth=0.8, dashes=(1.2, 1.6), zorder=1)
-        ax.annotate(r"$\eta=n^{-1/6}$", xy=(auxiliary ** (-1 / 6), 1.0), xycoords=("data", "axes fraction"),
+        # The bound balances at eta ~ n_0^(-1/6), with n_0 = n / (2 d_theta) particles per shifted system.
+        per_system = verify_bounds.BENCHMARKS[env][5] / (2 * run_plan.TRANSPORT_ALLOCATIONS[env]["d_theta"])
+        ax.axvline(per_system ** (-1 / 6), color=MUTED, linewidth=0.8, dashes=(1.2, 1.6), zorder=1)
+        ax.annotate(r"$\eta=n_0^{-1/6}$", xy=(per_system ** (-1 / 6), 1.0), xycoords=("data", "axes fraction"),
                     xytext=(3, -8), textcoords="offset points", fontsize=5.8, color=MUTED)
         _finish(ax, r"$\eta$", "squared error", DISPLAY[env].replace("--", "-"))
     figure_legend(figure, axes, (), 2)
@@ -1726,6 +1741,7 @@ def main():
     main_benchmarks(results_root, figures / "main_benchmarks.pdf")
     main_diagnostics(results_root, ROOT / args.theory_estimate, ROOT / args.theory_consistency,
                      figures / "main_diagnostics.pdf")
+    lambda_tradeoff(results_root, figures / "lambda_tradeoff.pdf")
     write_table(main_summary(results_root), tables / "main_summary.tex")
     appendix_benchmarks(results_root, figures / "appendix_benchmarks.pdf")
     discrete_eta(ROOT / args.discrete_eta, figures / "discrete_eta.pdf")

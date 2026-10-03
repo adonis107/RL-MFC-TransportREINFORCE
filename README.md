@@ -7,9 +7,6 @@ Code for the mean-field control experiments comparing:
 - Transport REINFORCE, with a zero-order population-flow sensitivity
 - Transport-Proba REINFORCE, with a likelihood-ratio population-flow sensitivity
   (continuous-state benchmarks only)
-- tabular mean-field Q-learning, on cybersecurity
-- centered finite differences of the objective, on the continuous-state benchmarks,
-  using the shifted systems of the transport auxiliary stage
 
 ## Setup
 
