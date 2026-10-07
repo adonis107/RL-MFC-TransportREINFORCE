@@ -556,6 +556,20 @@ CAPTION = (
 )
 
 
+def tex_scientific(value):
+    if value == 0.0:
+        return "0"
+    mantissa, exponent = f"{value:.1e}".split("e")
+    return f"{mantissa}\\cdot10^{{{int(exponent)}}}"
+
+
+def tex_spread(mean, deviation, digits):
+    """Mean and deviation of a column; scientific notation where the mean is below the table's precision."""
+    if 0.0 < mean < 10.0 ** -digits:
+        return f"${tex_scientific(mean)}\\pm{tex_scientific(deviation)}$"
+    return f"${mean:.{digits}f}\\pm{deviation:.{digits}f}$"
+
+
 def tex_table(collected, path):
     """LaTeX form of the decomposition, every arm of every benchmark."""
     digits = 4
@@ -587,8 +601,8 @@ def tex_table(collected, path):
                     name if position == 0 else "",
                     f"${scale:.3g}$",
                     f"${shift:.{digits}f}$",
-                    f"${opt:.{digits}f}\\pm{opt_sd:.{digits}f}$",
-                    f"${true:.{digits}f}\\pm{true_sd:.{digits}f}$",
+                    tex_spread(opt, opt_sd, digits),
+                    tex_spread(true, true_sd, digits),
                 ]) + " \\\\")
                 first = False
             if block:
