@@ -53,7 +53,6 @@ class TrafficTests(unittest.TestCase):
 
     def test_shapes_derivatives_and_boundaries(self):
         env = Traffic(self.config)
-        # Wrap forward at the last cell, clip outward lateral movement at each edge.
         self.assertEqual(env.transition(torch.tensor(3), None, torch.tensor(6)).argmax().item(), 1)
         self.assertEqual(env.transition(torch.tensor(11), None, torch.tensor(8)).argmax().item(), 9)
         states = torch.tensor([0, 4, 11])

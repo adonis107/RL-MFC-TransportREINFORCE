@@ -29,8 +29,7 @@ def dataclass_from_dict(config_class, values, device=None):
     config = config_class()
     names = {field.name for field in fields(config)}
     cleaned = clean_config_values(values)
-    # Traffic runs predating the initial-law field used only Dirichlet laws.
-    # Keep their recorded protocol when the current benchmark default changes.
+    # Reconstruct legacy traffic runs with their original defaults.
     if config_class is ENVIRONMENTS["traffic"][1]:
         cleaned.setdefault("training_initial_law", "dirichlet")
         cleaned.setdefault("congestion_reward", "local")

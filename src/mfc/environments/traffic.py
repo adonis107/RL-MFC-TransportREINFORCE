@@ -85,7 +85,6 @@ class Traffic:
     def __init__(self, config=TrafficConfig()):
         self.config, self.device, self.dtype = config, config.device, getattr(torch, config.precision)
         self.n_states, self.n_actions = 3 * config.cells, 9
-        # Same dense-kernel memory guard as the source benchmark.
         if 8 * self.n_states ** 2 * 20 > 64 * 1024 ** 2:
             raise MemoryError("physical transition tensors exceed 64 MiB budget")
         states = torch.arange(self.n_states, device=self.device)
@@ -95,7 +94,7 @@ class Traffic:
         lateral = (self.lanes[None, :] - self.lanes[:, None]).to(self.dtype)
         self.risk_matrix = torch.exp(-torch.hypot(forward / config.forward_scale, lateral / config.lateral_scale))
         self.initial_distribution = torch.zeros(self.n_states, dtype=self.dtype, device=self.device)
-        # Fixed jam for validation: all lanes at position zero (a source-supported jam).
+        # Validation jam: equal lane masses at cell zero.
         self.initial_distribution[::config.cells] = 1 / 3
         actions = torch.arange(9, device=self.device)
         self.speed = (actions // 3).to(self.dtype) / 2
@@ -110,12 +109,7 @@ class Traffic:
                 self.transitions.scatter_add_(-1, targets.unsqueeze(-1), torch.full_like(targets, chance * probability, dtype=self.dtype).unsqueeze(-1))
 
     def sample_initial_distribution(self, generator):
-        """Source-supported random or jam laws, sampled once per update.
-
-        Mixed training samples source-style random arcs and lane masses as
-        well as diffuse laws. Explicit dirichlet mode preserves historical
-        draws exactly; validation remains the fixed jam at construction.
-        """
+        """Sample a diffuse law, a random jam arc, or their mixture."""
         family = self.config.training_initial_law
         jam = family == "jam"
         if family == "mixed":
@@ -150,7 +144,7 @@ class Traffic:
         return reward + torch.zeros_like(states, dtype=self.dtype)
 
     def terminal_reward(self, states, mu):
-        # Source objective is discounted running reward with artificial truncation.
+        # Artificial truncation has no terminal payoff.
         return torch.zeros_like(states, dtype=self.dtype)
 
     def policy(self, theta, t, state, mu):

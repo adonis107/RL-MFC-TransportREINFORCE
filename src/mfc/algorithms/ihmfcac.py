@@ -1,9 +1,6 @@
 """Fouque--Lauriere--Zhang (arXiv:2511.06812v1), Algorithm 2.
 
-One continuing path and empirical measure per state/action bin, one critic per
-bin, and a separate actor path. No finite-horizon TD targets or episode resets.
-We use reward critics (max), the sign-equivalent of cost critics (min).
-See docs/IH_MFC_AC.md for reference ambiguities and scope of applicability.
+Reward critics maximize value, reversing the reference's cost convention.
 """
 from dataclasses import asdict, dataclass
 import math
@@ -42,11 +39,7 @@ class IHMFCACConfig:
 
 
 class StationaryActor(nn.Module):
-    """State-only actor; categorical for finite spaces, Gaussian for R.
-
-    This is the reference actor class, not a benchmark's constrained policy.
-    Evaluation ignores the population argument and time, just as training does.
-    """
+    """Stationary state-only actor: categorical on finite states, Gaussian on R."""
     is_stationary_actor = True
 
     def __init__(self, n_states=None, n_actions=None, width=64, std_floor=1e-5):
@@ -92,12 +85,7 @@ class StationaryActor(nn.Module):
 
 
 class IHMFCAC:
-    """Single-sample Algorithm 2; all bin trajectories advance every iteration.
-
-    Finite states/actions use singleton bins. Continuous support currently uses
-    the stationary scalar LQ simulator. Portfolio and bimodal are not silently
-    converted into continuing problems (their payoffs are terminal).
-    """
+    """Single-sample Algorithm 2 with one continuing trajectory and critic per bin."""
     def __init__(self, env, config=IHMFCACConfig()):
         self.env, self.config = env, config
         self.discrete = hasattr(env, "n_states")
@@ -232,7 +220,6 @@ class IHMFCAC:
             actions = self.policy.sample_actions(states, self.generator)
             actions[:-1] = torch.where(active, self.bin_actions, actions[:-1])
             rewards = self.env.reward(states, laws, actions)
-            # All supported training kernels are time homogeneous.
             next_states = self.env.sample(states, laws, actions, self.generator)
             self.simulator_transitions += self.transitions_per_iteration
             # All targets use the iteration-n snapshot; no gradient through targets.
@@ -297,7 +284,6 @@ class IHMFCAC:
         return self.policy, history
 
     def checkpoint(self):
-        """Full learning state, in addition to the standalone evaluation actor."""
         return {"config": asdict(self.config), "actor": self.policy.export_payload(),
                 "critics": self.critics.state_dict(), "states": self.states,
                 "population": self.population, "iterations": self.iterations,

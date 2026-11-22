@@ -1,13 +1,7 @@
-"""Select traffic allocations by the paper's gradient-MSE criterion.
+"""Select traffic allocations by raw gradient MSE over three reference policies.
 
-Uses three independently warm-started REINFORCE policies, then evaluation-only
-exact gradients. The traffic warm-start length is an explicit extension setting
-(the paper does not prescribe traffic settings). Simulation calibration uses
-120 independent replications by default, at lambda*=B^(-1/4).
-Historical exact-optimizer calibration files are retained separately.
-The split grid is screened at eta=.95, sigma=.5, then the paper's full eta/sigma
-grid is screened at the selected split. Calibration calls are outside the
-training budget, as are validation and the exact-gradient diagnostics.
+Screen the split at eta=.95, sigma=.5, then eta/sigma at lambda*=B^(-1/4).
+Calibration transitions are separate from the training budget.
 """
 import argparse
 import csv

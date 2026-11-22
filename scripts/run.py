@@ -19,16 +19,9 @@ DISCRETE_REFERENCE = {
     "advertising": {"n_particles": 200, "n_gradient": 10},
 }
 
-# Auxiliary split selected for MF-REINFORCE against each benchmark's gradient oracle, by the same
-# procedure used to size the transport block. Its cost model is B*T + n*T*(T+1), so these respect the
-# same matched budget as the published allocation they replace. Benchmarks absent here were screened
-# and carried too little gradient signal for the selection to mean anything, so they keep the
-# published allocation of the reference configuration.
-# Best scales of the MF-REINFORCE reference; advertising, absent there, was screened in {0.5, 1, 2}.
-# Traffic epsilon=2 adopted after the paired seed-0 comparison; configs/traffic.json
-# records its provenance and the unchanged matched-budget allocation.
 MF_REINFORCE_EPSILON = {"traffic": 2.0, "twostate": 0.2, "cybersecurity": 1.0, "distribution": 2.0, "advertising": 1.0}
 
+# Auxiliary splits selected by gradient MSE at the matched budget.
 MF_REINFORCE_SPLITS = {
     "traffic": {"n_particles": 1012, "n_logit_gradient": 10},
     "twostate": {"n_particles": 20, "n_logit_gradient": 40},
@@ -41,25 +34,15 @@ CONTINUOUS_REFERENCE = {
     "bimodal": {"n_particles": 2000, "n_gradient": 1},
 }
 
-# The bimodal benchmark exists to compare mixture sizes: a single Gaussian sees
-# no dependence of the population on the policy, two components see all of it.
 CONTINUOUS_COMPONENTS = {
     "lq": (1,),
     "portfolio": (1,),
     "bimodal": (1, 2),
 }
 
-# Transport allocations: M is the population block, n the auxiliary sensitivity block and
-# B the main trajectory block, for a cost of T (M + n + B) transitions per update.
-#   finite      n + B matches the published MF-REINFORCE cost per update, split between n
-#               and B by gradient MSE against the oracle; M is the particle count of that
-#               reference, and every method of a benchmark gets the same population block.
-#   continuous  n = 2 d_theta * 128, that is 128 particles per shifted system; the bimodal
-#               benchmark (d_theta = 1) instead gives each of its two systems 4000 particles,
-#               which its two-component fits need.
+# Population M, auxiliary n and main B cost T(M+n+B) transitions per update.
+# Continuous sensitivities use 128 particles per parameter shift, except bimodal.
 TRANSPORT_ALLOCATIONS = {
-    # Shared congestion, 3 cells/lane, T=5, float64. Raw-gradient-MSE screen:
-    # results/traffic_shared_calibration/selection.json; matched cost 6360/update.
     "traffic": {
         "horizon": 5, "M": 200, "n": 536, "B": 536,
         "updates": 10_000, "lr": 1e-3, "simplex_sigma": 0.5,
@@ -118,10 +101,6 @@ TRANSPORT_ALLOCATIONS = {
         "lr": 1e-2,
         "d_theta": 20,
     },
-    # T = 1 makes a large main block cheap, and the bimodal objective needs one:
-    # its perturbed optimum drifts quickly with lambda (0.885, 0.898 and 0.923 at
-    # lambda = 0.025, 0.05 and 0.1, against theta* = 0.868), so B = 1e5 puts the
-    # bound grid at lambda* = B^(-1/4) = 0.056 and its halves and doubles.
     "bimodal": {
         "horizon": 1,
         "M": 2000,
@@ -133,9 +112,7 @@ TRANSPORT_ALLOCATIONS = {
     },
 }
 
-# Main scales lambda* times these, with lambda* = B^(-1/4) the order of the bound. The
-# grid reaches down to lambda*/8: in earlier sweeps the best scale sat below lambda*/2 on
-# two-state control and both continuous benchmarks, and near lambda* on the others.
+# Multipliers of lambda*=B^(-1/4).
 BOUND_LAMBDA_MULTIPLIERS = (0.125, 0.25, 0.5, 1.0, 2.0)
 # Auxiliary radii the bound suggests, eta* = n^(-1/4) halved and doubled (two-state sweep).
 BOUND_ETA_MULTIPLIERS = (0.5, 1.0, 2.0)
@@ -155,15 +132,7 @@ def effective_auxiliary_samples(env):
     return auxiliary
 
 
-# Auxiliary radius, selected in LARGE_AUXILIARY_ETAS by the mean-square error of the
-# gradient estimate against each benchmark's exact gradient, rather than derived. In finite
-# state space it is selected jointly with simplex_sigma by scripts/tune_perturbation.py, at
-# lambda* and over three warm-started reference policies.
-# Balancing the error bound gives eta ~ n^(-1/4) in finite state space and n^(-1/6) in
-# continuous state space, but its eta term is carried by the dependence of the kernel and
-# policy on the population argument, which is weak here, so the minimiser sits at the top
-# of the admissible range instead. See scripts/verify_discrete_eta.py (finite) and
-# scripts/verify_bounds.py (continuous). Benchmarks absent here fall back to the asymptotic rule.
+# Joint eta/sigma selection by gradient MSE at lambda*, over three reference policies.
 LARGE_AUXILIARY_ETAS = (0.85, 0.95, 0.98)
 MEASURED_AUXILIARY_ETA = {
     "traffic": 0.98,
@@ -173,9 +142,7 @@ MEASURED_AUXILIARY_ETA = {
     "advertising": 0.95,
     "lq": 0.95,
     "portfolio": 0.95,
-    # Not measured: the largest radius that keeps every shifted policy valid.
-    # Theta = [0.75, 0.95] and the policy variance 0.99 - 1.01 theta^2 vanishes
-    # at theta = 0.990, so the shared grid {0.85, 0.95, 0.98} is not admissible.
+    # Bimodal shifts must stay inside the policy's admissible parameter range.
     "bimodal": 0.04,
 }
 

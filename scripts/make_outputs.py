@@ -61,8 +61,6 @@ from mfc.visualization.io import dataclass_from_dict
 
 
 BENCHMARKS = ["traffic", "twostate", "cybersecurity", "distribution", "advertising", "lq", "portfolio", "bimodal"]
-# Continuous-state benchmarks carry the mixture chart and the Gaussian-manifold
-# arm; the other groups name the figure each set of benchmarks appears on.
 CONTINUOUS_ENVS = ["lq", "portfolio"]
 MAIN_ENVS = ["twostate", "distribution", "lq", "portfolio", "bimodal"]
 APPENDIX_ENVS = ["cybersecurity", "advertising", "traffic"]
@@ -76,9 +74,6 @@ DISPLAY = {
     "portfolio": "Portfolio",
     "bimodal": "Bimodal allocation",
 }
-# Mixture size of the transport run reported for each continuous benchmark. The
-# bimodal benchmark is reported with two components, the size it is built to need;
-# its single-Gaussian arm is drawn beside it as "Transport, K=1".
 TRANSPORT_COMPONENTS = {"lq": 1, "portfolio": 1, "bimodal": 2}
 MAIN_FLOW = {
     "traffic": "particle",
@@ -109,7 +104,6 @@ METHOD_COLOR = {"REINFORCE": "#eb6834", "MF-REINFORCE": "#eda100", "Transport": 
 METHOD_MARKER = {"REINFORCE": "s", "MF-REINFORCE": "D", "Transport": "o", "Transport-Proba": "^",
                  "Transport, K=1": "v", "Finite differences": "P"}
 OPTIMAL = "#52514e"
-# One colour and marker per benchmark, shared by every diagnostic figure.
 ENV_COLOR = {"traffic": "#6b705c", "lq": "#2a78d6", "portfolio": "#eb6834", "bimodal": "#7b3fbf", "twostate": "#1baf7a",
              "distribution": "#eda100", "cybersecurity": "#e87ba4", "advertising": "#008300"}
 ENV_MARKER = {"traffic": "h", "lq": "o", "portfolio": "s", "bimodal": "X", "twostate": "^", "distribution": "D",
@@ -164,7 +158,7 @@ def has_run(results_root, env):
 
 
 def load_env_runs(results_root, env):
-    """Active runs of one benchmark (historical Q-learning is excluded by load_runs)."""
+    """Load active runs for one benchmark."""
     directory = env_dir(results_root, env)
     runs = load_runs(directory.parent, env=directory.name) if directory.name == env else load_runs(directory)
     if env == "traffic":
@@ -692,7 +686,6 @@ def main_benchmarks(results_root, output):
         draw_ihmfc_flow(axes[1, index], results_root, env)
         axes[0, index].set_title(ENV_SHORT[env], fontsize=7.4, color=INK, pad=4)
         axes[0, index].set_ylabel("Optimality gap", fontsize=7.5)
-        # The flow panels are identified by their column; keep only what they show.
         flow_ax = axes[1, index]
         flow_title = flow_ax.get_title().split(": ", 1)[-1]
         flow_ax.set_title(f"{flow_title} {flow_ax.get_ylabel()}", fontsize=6.8, color=MUTED, pad=3)
@@ -1342,7 +1335,6 @@ def table_environment(body, caption, label, alignment, size=None, wide=False, ta
             "\\centering",
             *([size] if size else []),
             *([f"\\setlength{{\\tabcolsep}}{{{tabcolsep}}}"] if tabcolsep else []),
-            # AISTATS sets table captions above the table.
             f"\\caption{{{caption}}}",
             f"\\label{{{label}}}",
             f"\\begin{{tabular}}{{{alignment}}}",

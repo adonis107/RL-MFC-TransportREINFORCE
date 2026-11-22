@@ -61,8 +61,6 @@ ENVIRONMENTS = {
 DISCRETE_ENVS = {"traffic", "twostate", "cybersecurity", "distribution", "advertising"}
 CONTINUOUS_ENVS = {"lq", "portfolio", "bimodal"}
 TRANSPORT_ALGORITHMS = {"transport"}
-# Transport on the Gaussian manifold with a likelihood-ratio flow sensitivity: no
-# auxiliary radius, so it is not part of the eta-carrying family above.
 GAUSSIAN_ALGORITHMS = {"gaussian"}
 
 
@@ -283,7 +281,6 @@ def build_algorithm(args, env):
         if args.env not in CONTINUOUS_ENVS:
             raise ValueError("Gaussian-manifold transport is only configured for continuous-state environments.")
         if args.env == "bimodal":
-            # This arm hands the environment the population mean, which the bimodal reward does not read.
             raise ValueError("Gaussian-manifold transport does not apply to the bimodal benchmark.")
         if args.perturbation is None:
             raise ValueError("Gaussian transport requires --perturbation lambda.")
@@ -439,8 +436,7 @@ def history_time_sum(history, key):
 
 
 def run_training(args):
-    # Argument validation of torch.distributions re-checks constraints on every draw;
-    # the policies here are valid by construction.
+    # Policies satisfy distribution constraints by construction.
     torch.distributions.Distribution.set_default_validate_args(False)
     torch.manual_seed(args.seed)
     env = build_environment(args)
@@ -465,9 +461,7 @@ def run_training(args):
         "flow": args.flow,
         "seed": args.seed,
         "code_version": code_version(),
-        # asdict() only sees dataclass fields, so an environment that derives its
-        # per-step discount from a rate (cybersecurity: gamma ** dt) would not record the
-        # value the algorithms actually use. Record it explicitly.
+        # Record derived discounts, such as cybersecurity's gamma**dt.
         "env_config": {key: json_ready(value) for key, value in asdict(env.config).items()},
         "resolved_discount": json_ready(algorithm.discount),
         "algorithm_config": {key: json_ready(value) for key, value in asdict(algorithm.config).items()},
