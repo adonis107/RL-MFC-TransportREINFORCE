@@ -109,7 +109,7 @@ def objective_table(runs):
             "validation_reward": run["summary"].get("last_validation_objective"),
         }
 
-        if hasattr(env, "objective"):
+        if hasattr(env, "objective") and not getattr(policy, "is_stationary_actor", False):
             row["objective_convention"] = "cost" if metadata["env"] == "lq" else "reward"
             theta = policy if not isinstance(policy, torch.nn.Module) else None
             # Each estimator randomizes the population its own way, so J^lambda
@@ -188,6 +188,7 @@ def runtime_table(runs):
             wall_seconds_per_step_mean=("wall_seconds_per_training_step", "mean"),
             validation_seconds_per_call_mean=("validation_seconds_per_call", "mean"),
             simulator_budget_mean=("simulator_budget_estimate", "mean"),
+            total_simulator_transitions_mean=("total_simulator_transitions", "mean"),
             n_runs=("seed", "count"),
         )
         .fillna(
@@ -206,6 +207,7 @@ def discrete_transport_tv_bound_table(runs):
     for run in runs:
         metadata = run["metadata"]
         if metadata["algorithm"] != "transport" or metadata["env"] not in {
+            "traffic",
             "twostate",
             "cybersecurity",
             "distribution",

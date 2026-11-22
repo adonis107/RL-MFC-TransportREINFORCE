@@ -8,9 +8,9 @@ from torch import nn
 
 from .mfreinforce import MFReinforce
 from .mixture import GaussianMixture, MixtureConstraints
-from .sampling import sample_accepts_time
+from .sampling import independent_return_advantages, sample_accepts_time
 from .timing import report_progress, synchronized_time
-from .validation import monte_carlo_objective
+from .validation import initial_population_law, monte_carlo_objective, particle_law
 
 
 @dataclass(frozen=True)
@@ -23,8 +23,9 @@ class DiscreteTransportConfig:
     validation_interval: int | None = None
     lambda_: float | None = None
     eta: float | None = None
+    auxiliary_batches: str = "shared"
     simplex_sigma: float = 1.0
-    flow: str = "exact"
+    flow: str = "particle"
     n_flow_particles: int | None = None
     baseline: bool = True
     reuse_state_gradient: bool = True
@@ -33,6 +34,8 @@ class DiscreteTransportConfig:
 
 class DiscreteTransport(MFReinforce):
     def __init__(self, env, policy=None, config=DiscreteTransportConfig()):
+        if config.auxiliary_batches not in {"shared", "fresh"}:
+            raise ValueError("auxiliary_batches must be shared or fresh.")
         super().__init__(env, policy=policy, config=config)
 
     @property
@@ -75,6 +78,9 @@ class DiscreteTransport(MFReinforce):
         return a / q[..., :-1] + a.sum(dim=-1, keepdim=True) / q[..., -1:] - 1.0 / q[..., :-1] + 1.0 / q[..., -1:]
 
     def estimate_state_sensitivities(self, laws, seed, initial_distribution=None, eta=None):
+        """Shared experimental batch, or fresh batches required by the theorem."""
+        if self.config.auxiliary_batches == "fresh":
+            return self.fresh_state_sensitivities(laws, seed, initial_distribution, eta)
         generator = torch.Generator(device=self.env.device)
         generator.manual_seed(seed)
         eta = self.eta if eta is None else eta
@@ -89,12 +95,12 @@ class DiscreteTransport(MFReinforce):
 
         for t in range(self.horizon):
             q = self.sample_simplex_batch(self.n_logit_gradient, generator)
-            perturbed_law = self.perturb_law(laws[t], q, eta)
+            perturbed_law = self.initial_population_argument(initial_distribution).expand_as(q) if t == 0 else self.perturb_law(laws[t], q, eta)
             with torch.no_grad():
                 actions, _ = self.sample_actions_with_log_probs(t, states[-1], perturbed_law, generator)
             perturbed_laws.append(perturbed_law)
             actions_taken.append(actions)
-            h_values.append(self.simplex_score_h(q))
+            h_values.append(torch.zeros_like(q[..., :-1]) if t == 0 else self.simplex_score_h(q))
 
             with torch.no_grad():
                 states.append(self.sample_next_state(t, states[-1], perturbed_law, actions, generator))
@@ -123,84 +129,102 @@ class DiscreteTransport(MFReinforce):
 
         return sensitivities
 
+    def fresh_state_sensitivities(self, laws, seed, initial_distribution=None, eta=None):
+        """Equation for D_hat_t with independent length-t auxiliary batches."""
+        eta = self.eta if eta is None else eta
+        initial = self.env.initial_distribution if initial_distribution is None else initial_distribution
+        generator = torch.Generator(device=self.env.device).manual_seed(seed)
+        n = self.n_logit_gradient
+        zero = torch.zeros(self.env.n_states, self.n_parameters, dtype=self.env.dtype, device=self.env.device)
+        sensitivities = [zero]
+        for target_t in range(1, self.horizon + 1):
+            states = self.initial_states(n, generator, initial)
+            score = torch.zeros(n, self.n_parameters, dtype=self.env.dtype, device=self.env.device)
+            for t in range(target_t):
+                if t == 0:
+                    law = initial.expand(n, -1)
+                else:
+                    q = self.sample_simplex_batch(n, generator)
+                    law = self.perturb_law(laws[t], q, eta)
+                    score = score - (1.0-eta)/eta * (self.simplex_score_h(q) @ sensitivities[t][:-1])
+                with torch.no_grad():
+                    actions, _ = self.sample_actions_with_log_probs(t, states, law, generator)
+                score = score + self.per_sample_log_prob_gradients(t, states, law, actions)
+                with torch.no_grad():
+                    states = self.sample_next_state(t, states, law, actions, generator)
+            current = torch.zeros_like(zero)
+            current[:-1] = self.state_indicators(states)[:-1] @ score / n
+            current[-1] = -current[:-1].sum(dim=0)
+            sensitivities.append(current)
+        return sensitivities
+
     def trajectory_gradient(self, laws, sensitivities, seed, initial_distribution=None):
         generator = torch.Generator(device=self.env.device)
         generator.manual_seed(seed)
 
-        base_state = self.initial_state(generator, initial_distribution)
         state = self.initial_state(generator, initial_distribution)
-        base_rewards = []
         rewards = []
         policy_score = torch.zeros(self.n_parameters, dtype=self.env.dtype, device=self.env.device)
         perturbation_score = torch.zeros(self.n_parameters, dtype=self.env.dtype, device=self.env.device)
 
         for t in range(self.horizon):
-            law = laws[t]
-            base_action, _ = self.sample_action(t, base_state, law, generator)
+            law = self.initial_population_argument(initial_distribution) if t == 0 else laws[t]
             q = self.sample_simplex(generator)
-            perturbed_law = self.perturb_law(law, q, self.lambda_)
+            perturbed_law = law if t == 0 else self.perturb_law(law, q, self.lambda_)
             action, _ = self.sample_action(t, state, perturbed_law, generator)
-            base_rewards.append(self.env.reward(base_state, law, base_action))
             rewards.append(self.env.reward(state, perturbed_law, action))
 
             policy_score = policy_score + self.log_prob_gradient(t, state, perturbed_law, action)
-            perturbation_score = perturbation_score + self.simplex_score_h(q) @ sensitivities[t][:-1]
+            if t > 0:
+                perturbation_score = perturbation_score + self.simplex_score_h(q) @ sensitivities[t][:-1]
 
             with torch.no_grad():
-                base_state = self.sample_next_state(t, base_state, law, base_action, generator)
                 state = self.sample_next_state(t, state, perturbed_law, action, generator)
 
         q_terminal = self.sample_simplex(generator)
-        terminal_law = self.perturb_law(laws[-1], q_terminal, self.lambda_)
+        terminal_law = laws[-1] if self.horizon == 0 else self.perturb_law(laws[-1], q_terminal, self.lambda_)
         terminal_reward = self.env.terminal_reward(state, terminal_law)
-        base_terminal_reward = self.env.terminal_reward(base_state, laws[-1])
         perturbation_score = perturbation_score + self.simplex_score_h(q_terminal) @ sensitivities[-1][:-1]
 
         trajectory_score = policy_score - ((1.0 - self.lambda_) / self.lambda_) * perturbation_score
         trajectory_return = self.discounted_returns(rewards, terminal_reward)[0]
-        base_return = self.discounted_returns(base_rewards, base_terminal_reward)[0]
-        return trajectory_score, trajectory_return, base_return
+        sampled_return = self.discounted_returns(rewards, terminal_reward)[0].detach()
+        return trajectory_score, trajectory_return, sampled_return
 
     def batched_trajectory_components(self, laws, seed, initial_distribution=None, lambda_=None):
         generator = torch.Generator(device=self.env.device)
         generator.manual_seed(seed)
         lambda_ = self.lambda_ if lambda_ is None else lambda_
 
-        base_states = self.initial_states(self.n_particles, generator, initial_distribution)
         states = self.initial_states(self.n_particles, generator, initial_distribution)
-        base_rewards = []
         rewards = []
         action_log_probs = []
         law_scores = []
 
         for t in range(self.horizon):
-            law = laws[t]
-            base_actions, _ = self.sample_actions_with_log_probs(t, base_states, law.expand(self.n_particles, -1), generator)
+            law = self.initial_population_argument(initial_distribution) if t == 0 else laws[t]
             q = self.sample_simplex_batch(self.n_particles, generator)
-            perturbed_law = self.perturb_law(law, q, lambda_)
+            perturbed_law = law.expand_as(q) if t == 0 else self.perturb_law(law, q, lambda_)
             actions, log_probs = self.sample_actions_with_log_probs(t, states, perturbed_law, generator)
-            base_rewards.append(self.env.reward(base_states, law, base_actions))
             rewards.append(self.env.reward(states, perturbed_law, actions))
             action_log_probs.append(log_probs)
-            law_scores.append(self.simplex_score_h(q))
+            law_scores.append(torch.zeros_like(q[..., :-1]) if t == 0 else self.simplex_score_h(q))
 
             with torch.no_grad():
-                base_states = self.sample_next_state(t, base_states, law, base_actions, generator)
                 states = self.sample_next_state(t, states, perturbed_law, actions, generator)
 
         q_terminal = self.sample_simplex_batch(self.n_particles, generator)
-        terminal_law = self.perturb_law(laws[-1], q_terminal, lambda_)
+        terminal_law = laws[-1].expand_as(q_terminal) if self.horizon == 0 else self.perturb_law(laws[-1], q_terminal, lambda_)
         terminal_reward = self.env.terminal_reward(states, terminal_law)
-        base_terminal_reward = self.env.terminal_reward(base_states, laws[-1])
         law_scores.append(self.simplex_score_h(q_terminal))
 
         returns = self.discounted_returns(rewards, terminal_reward)[0]
-        base_return = self.discounted_returns(base_rewards, base_terminal_reward)[0]
-        advantages = returns - returns.mean() if self.config.baseline else returns
+        sampled_return = self.discounted_returns(rewards, terminal_reward)[0].detach()
+        advantages = independent_return_advantages(returns) if self.config.baseline else returns
         action_score = torch.stack(action_log_probs).sum(dim=0)
         action_gradient = self.flat_grad((action_score * advantages.detach()).sum())
         weights = advantages.detach()
-        return action_gradient, weights, law_scores, base_return.mean()
+        return action_gradient, weights, law_scores, sampled_return.mean()
 
     def combine_batched_trajectory_components(self, action_gradient, weights, law_scores, sensitivities, lambda_=None):
         lambda_ = self.lambda_ if lambda_ is None else lambda_
@@ -211,13 +235,13 @@ class DiscreteTransport(MFReinforce):
         return (action_gradient + law_gradient) / self.n_particles
 
     def batched_trajectory_gradient(self, laws, sensitivities, seed, initial_distribution=None):
-        action_gradient, weights, law_scores, base_return = self.batched_trajectory_components(
+        action_gradient, weights, law_scores, sampled_return = self.batched_trajectory_components(
             laws,
             seed,
             initial_distribution=initial_distribution,
         )
         gradient = self.combine_batched_trajectory_components(action_gradient, weights, law_scores, sensitivities)
-        return gradient, base_return
+        return gradient, sampled_return
 
     def estimate_gradient(self, seed):
         law_generator = torch.Generator(device=self.env.device)
@@ -252,7 +276,7 @@ class DiscreteTransport(MFReinforce):
                 initial_distribution=initial_distribution,
             )
 
-            score, trajectory_return, base_return = self.trajectory_gradient(
+            score, trajectory_return, sampled_return = self.trajectory_gradient(
                 laws,
                 sensitivities,
                 seed + b,
@@ -261,15 +285,15 @@ class DiscreteTransport(MFReinforce):
             if self.config.baseline:
                 scores.append(score)
                 returns.append(trajectory_return)
-                return_sum = return_sum + base_return.detach()
+                return_sum = return_sum + sampled_return.detach()
             else:
                 gradient = gradient + score * trajectory_return.detach()
-                return_sum = return_sum + base_return.detach()
+                return_sum = return_sum + sampled_return.detach()
 
         if self.config.baseline:
             scores = torch.stack(scores)
             objectives = torch.stack(returns)
-            advantages = objectives - objectives.mean()
+            advantages = independent_return_advantages(objectives)
             gradient = (scores * advantages.detach().unsqueeze(-1)).sum(dim=0)
 
         gradient = gradient / self.n_particles
@@ -335,7 +359,7 @@ class ContinuousTransport:
     Gaussian mixture. The main perturbation follows the transport construction in
     the reference: component weights are mixed with random weights, component
     means are moved toward random target means, and one-dimensional component
-    standard deviations move along their Gaussian Wasserstein geodesics. One
+    standard deviations are multiplied by (1-lambda) + lambda B_j. One
     policy update runs the three independent simulation blocks of Algorithm
     "Transport REINFORCE":
 
@@ -595,9 +619,11 @@ class ContinuousTransport:
 
     def discounted_returns(self, rewards, terminal_reward):
         values = [None] * (len(rewards) + 1)
-        values[-1] = terminal_reward
+        # Absolute-time discounting is required when each tail multiplies its
+        # time-t score; a relative tail would omit the outer discount**t.
+        values[-1] = self.discount**len(rewards) * terminal_reward
         for t in range(len(rewards) - 1, -1, -1):
-            values[t] = rewards[t] + self.discount * values[t + 1]
+            values[t] = self.discount**t * rewards[t] + values[t + 1]
         return values
 
     def sample_perturbations(self, shape, generator):
@@ -613,8 +639,8 @@ class ContinuousTransport:
         """Draw the continuous-state randomizer R=(Q,A,B) in encoded form.
 
         The returned tensor uses the same packing as the mixture coordinate, but
-        its entries parameterize the random target mixture: softmax logits for Q,
-        target means A, and target log standard deviations for sqrt(B). The
+        its entries encode softmax logits for Q, target means A, and log relative
+        scale factors B (lognormal, hence positive for every scale). The
         transport map below converts these target parameters into the actual
         perturbed mixture parameters.
         """
@@ -659,21 +685,21 @@ class ContinuousTransport:
         """Apply the Gaussian-mixture transport perturbation from the reference.
 
         The current implementation supports the one-dimensional continuous
-        benchmarks in this repository. For d=1, the Wasserstein geodesic between
-        Gaussian components moves standard deviations linearly.
+        benchmarks in this repository. Equation 13 multiplies each source
+        standard deviation by (1-scale) + scale B_j, with B_j > 0.
         """
         if self.state_dim != 1:
             raise NotImplementedError("Continuous transport randomization currently supports one-dimensional states.")
 
-        target_beta, target_means, target_scales = self.mixture.unpack(randomizer)
+        target_beta, target_means, log_relative_scales = self.mixture.unpack(randomizer)
         source_weights, source_means, source_scale_tril = self.mixture.decode(coordinate)
         target_weights = self.mixture.weights(target_beta)
-        target_std = torch.exp(target_scales[..., :, 0])
+        relative_scale = torch.exp(log_relative_scales[..., :, 0])
         source_std = source_scale_tril[..., :, 0, 0]
 
         perturbed_weights = (1.0 - scale) * source_weights + scale * target_weights
         perturbed_means = (1.0 - scale) * source_means + scale * target_means
-        perturbed_std = (1.0 - scale) * source_std + scale * target_std
+        perturbed_std = source_std * ((1.0 - scale) + scale * relative_scale)
         perturbed_scale_tril = torch.zeros(
             perturbed_std.shape + (1, 1),
             dtype=perturbed_std.dtype,
@@ -683,7 +709,12 @@ class ContinuousTransport:
         return self.mixture.encode(perturbed_weights, perturbed_means, perturbed_scale_tril)
 
     def transport_log_density(self, perturbed_coordinate, coordinate, scale):
-        """log h^scale(y | z) for the implemented one-dimensional randomizer."""
+        """Density in the encoded mixture chart, for one-dimensional states.
+
+        Changing from physical mixture parameters to this chart contributes a
+        Jacobian depending only on y, so the base-coordinate score is still
+        grad_z log h^scale(y | z) from the paper.
+        """
         if self.state_dim != 1:
             raise NotImplementedError("Continuous transport density currently supports one-dimensional states.")
         if scale <= 0.0 or scale >= 1.0:
@@ -720,16 +751,22 @@ class ContinuousTransport:
 
         y_std = torch.exp(scales_y[..., :, 0])
         z_std = torch.exp(scales_z[..., :, 0])
-        target_std = (y_std - (1.0 - scale) * z_std).clamp_min(tiny) / scale
+        # Invert sigma_y = sigma_z ((1-scale) + scale B).
+        relative_std = y_std / z_std
+        residual = relative_std - (1.0 - scale)
+        target_std = residual.clamp_min(tiny) / scale
         target_log_std = torch.log(target_std)
         log_density = log_density + self._normal_log_density(
             target_log_std,
             self.config.log_scale_randomizer_sigma,
         ).sum(dim=-1)
         log_density = log_density + (
-            torch.log(y_std.clamp_min(tiny)) - torch.log((y_std - (1.0 - scale) * z_std).clamp_min(tiny))
+            torch.log(relative_std.clamp_min(tiny)) - torch.log(residual.clamp_min(tiny))
         ).sum(dim=-1)
-        return log_density
+        valid = (residual > 0.0).all(dim=-1)
+        if self.config.n_components > 1:
+            valid = valid & ((weights_y - (1.0 - scale) * weights_z) > 0.0).all(dim=-1)
+        return torch.where(valid, log_density, -torch.inf)
 
     def transport_scores(self, perturbed_coordinates, coordinate, scale):
         """Score s^scale(y, z)=grad_z log h^scale(y | z), for every y.
@@ -746,6 +783,7 @@ class ContinuousTransport:
     def population_coordinates(self, horizon=None, seed=None, jacobians=True, n_particles=None, update_cache=True):
         """Fit the mixture coordinate along the represented flow.
 
+        The population dynamics use empirical laws; the fit is only an encoder.
         Returns the coordinates z_0, ..., z_T and, when requested, the empirical
         score Jacobians A_t = M^{-1} sum_i D_z psi_K(X_t^i, z_t). With
         flow='exact' and an environment exposing its analytic moment flow, the
@@ -785,7 +823,7 @@ class ContinuousTransport:
             if t == horizon:
                 break
 
-            law = self.population_law(coordinate)
+            law = particle_law(self.env, states)
             actions = self.sample_actions_for_population(t, states, law, generator)
             with torch.no_grad():
                 states = self.sample_next_states_for_population(t, states, law, actions, generator)
@@ -955,7 +993,7 @@ class ContinuousTransport:
         The 2 d_theta systems are independent interacting particle systems, so
         simulating them side by side only stacks their particles: each particle
         carries the parameter of its own system in a trailing dimension, and reads
-        the fitted law of its own system. Returns the plus and minus flows, each
+        the empirical law of its own system. Returns the plus and minus flows, each
         shaped (d_theta, T + 1, q_K).
         """
         n0 = self.n_law_particles_per_shift
@@ -976,7 +1014,12 @@ class ContinuousTransport:
             flows.append(coordinate)
             if t == self.horizon:
                 break
-            law = self.population_law(coordinate).repeat_interleave(n0, dim=0)
+            grouped_states = states.reshape(systems, n0, *states.shape[1:])
+            if hasattr(self.env, "empirical_law"):
+                system_laws = self.env.empirical_law(grouped_states)
+            else:
+                system_laws = grouped_states.mean(dim=1)
+            law = system_laws.repeat_interleave(n0, dim=0)
             with torch.no_grad():
                 if hasattr(self.env, "sample_action"):
                     actions = self.env.sample_action(per_particle, t, states, law, generator)
@@ -985,6 +1028,25 @@ class ContinuousTransport:
                 states = self.sample_next_states_for_population(t, states, law, actions, generator)
         flows = torch.stack(flows, dim=1)
         return flows[: self.n_parameters], flows[self.n_parameters :]
+
+    def physical_coordinate_secant(self, plus, minus, base, eta):
+        """Paper's physical-parameter difference, expressed in the score chart.
+
+        The paper stacks weights, means and covariances. Taking secants of
+        logits or log standard deviations would change its finite-eta estimator.
+        Only the resulting tangent is converted to the internal chart at base.
+        """
+        if self.state_dim != 1:
+            raise NotImplementedError("Physical transport secants currently support one-dimensional states.")
+        p_plus, m_plus, l_plus = self.mixture.decode(plus)
+        p_minus, m_minus, l_minus = self.mixture.decode(minus)
+        p, _, l = self.mixture.decode(base)
+        dp = (p_plus - p_minus) / (2.0 * eta)
+        d_beta = dp[..., :-1] / p[..., :-1] - dp[..., -1:] / p[..., -1:]
+        dm = (m_plus - m_minus) / (2.0 * eta)
+        d_variance = (l_plus[..., 0, 0].square() - l_minus[..., 0, 0].square()) / (2.0 * eta)
+        d_log_std = d_variance / (2.0 * l[..., 0, 0].square())
+        return torch.cat([d_beta, dm.flatten(-2), d_log_std], dim=-1)
 
     def estimate_coordinate_sensitivities(self, coordinates, score_jacobians=None, seed=0, eta=None):
         """Estimate D_t = grad_theta z_t by centered policy differences.
@@ -1007,7 +1069,7 @@ class ContinuousTransport:
 
         if self.batched_shifts():
             plus, minus = self.shifted_flows(coordinates, seed, eta)
-            differences = (plus - minus) / (2.0 * eta)
+            differences = self.physical_coordinate_secant(plus, minus, torch.stack(coordinates), eta)
             for t in range(1, self.horizon + 1):
                 sensitivities[t] = differences[:, t].T.contiguous()
             return sensitivities
@@ -1028,7 +1090,7 @@ class ContinuousTransport:
                 warm_start=coordinates,
             )
             for t in range(1, self.horizon + 1):
-                sensitivities[t][:, parameter_index] = (plus[t] - minus[t]) / (2.0 * eta)
+                sensitivities[t][:, parameter_index] = self.physical_coordinate_secant(plus[t], minus[t], coordinates[t], eta)
 
         return sensitivities
 
@@ -1042,101 +1104,91 @@ class ContinuousTransport:
         generator.manual_seed(seed)
         lambda_ = self.lambda_ if lambda_ is None else lambda_
 
-        base_state = self.initial_state(generator)
         state = self.initial_state(generator)
-        base_rewards = []
         rewards = []
         score_terms = []
 
         for t in range(self.horizon):
-            law = self.population_law(coordinates[t])
-            base_action = self.sample_action(t, base_state, law, generator)
+            law = initial_population_law(self.env) if t == 0 else self.population_law(coordinates[t])
             randomizer = self.sample_transport_randomizers((), generator)
-            perturbed_coordinate = self.transport_coordinate(coordinates[t], randomizer, lambda_)
-            perturbed_law = self.population_law(perturbed_coordinate)
+            perturbed_coordinate = coordinates[t].expand_as(randomizer) if t == 0 else self.transport_coordinate(coordinates[t], randomizer, lambda_)
+            perturbed_law = law if t == 0 else self.population_law(perturbed_coordinate)
             action = self.sample_action(t, state, perturbed_law, generator)
 
-            law_score = self.coordinate_score(perturbed_coordinate, coordinates[t], sensitivities[t], lambda_)
+            law_score = torch.zeros_like(sensitivities[t][0]) if t == 0 else self.coordinate_score(perturbed_coordinate, coordinates[t], sensitivities[t], lambda_)
             action_score = self.log_prob_gradient(t, state, perturbed_law, action)
             score_terms.append(law_score + action_score)
-            base_rewards.append(self.env.reward(base_state, law, base_action))
             rewards.append(self.env.reward(state, perturbed_law, action))
 
             with torch.no_grad():
-                base_state = self.sample_next_state(t, base_state, law, base_action, generator)
                 state = self.sample_next_state(t, state, perturbed_law, action, generator)
 
-        terminal_law = self.population_law(coordinates[-1])
+        terminal_law = initial_population_law(self.env) if self.horizon == 0 else self.population_law(coordinates[-1])
         randomizer = self.sample_transport_randomizers((), generator)
         perturbed_terminal_coordinate = self.transport_coordinate(coordinates[-1], randomizer, lambda_)
-        perturbed_terminal_law = self.population_law(perturbed_terminal_coordinate)
+        perturbed_terminal_law = terminal_law if self.horizon == 0 else self.population_law(perturbed_terminal_coordinate)
         terminal_reward = self.env.terminal_reward(state, perturbed_terminal_law)
-        base_terminal_reward = self.env.terminal_reward(base_state, terminal_law)
         score_terms.append(
-            self.coordinate_score(perturbed_terminal_coordinate, coordinates[-1], sensitivities[-1], lambda_)
+            torch.zeros_like(sensitivities[0][0]) if self.horizon == 0 else self.coordinate_score(perturbed_terminal_coordinate, coordinates[-1], sensitivities[-1], lambda_)
         )
 
         returns = self.discounted_returns(rewards, terminal_reward)
-        base_return = self.discounted_returns(base_rewards, base_terminal_reward)[0]
-        return torch.stack(score_terms), torch.stack(returns), base_return
+        sampled_return = self.discounted_returns(rewards, terminal_reward)[0].detach()
+        return torch.stack(score_terms), torch.stack(returns), sampled_return
 
     def batched_trajectory_components(self, coordinates, seed, lambda_=None):
         generator = torch.Generator(device=self.env.device)
         generator.manual_seed(seed)
         lambda_ = self.lambda_ if lambda_ is None else lambda_
 
-        base_states = self.initial_states(self.n_particles, generator)
         states = self.initial_states(self.n_particles, generator)
-        base_rewards = []
         rewards = []
         action_log_probs = []
         perturbed_coordinates = []
 
         for t in range(self.horizon):
-            law = self.population_law(coordinates[t])
-            base_action, _ = self.sample_actions_with_log_probs(t, base_states, law, generator)
+            law = initial_population_law(self.env) if t == 0 else self.population_law(coordinates[t])
             randomizer = self.sample_transport_randomizers((self.n_particles,), generator)
-            perturbed_coordinate = self.transport_coordinate(coordinates[t], randomizer, lambda_)
-            perturbed_law = self.population_law(perturbed_coordinate)
+            perturbed_coordinate = coordinates[t].expand_as(randomizer) if t == 0 else self.transport_coordinate(coordinates[t], randomizer, lambda_)
+            perturbed_law = law if t == 0 else self.population_law(perturbed_coordinate)
             action, log_prob = self.sample_actions_with_log_probs(t, states, perturbed_law, generator)
 
             perturbed_coordinates.append(perturbed_coordinate)
             action_log_probs.append(log_prob)
-            base_rewards.append(self.env.reward(base_states, law, base_action))
             rewards.append(self.env.reward(states, perturbed_law, action))
 
             with torch.no_grad():
-                base_states = self.sample_next_state(t, base_states, law, base_action, generator)
                 states = self.sample_next_state(t, states, perturbed_law, action, generator)
 
-        terminal_law = self.population_law(coordinates[-1])
+        terminal_law = initial_population_law(self.env) if self.horizon == 0 else self.population_law(coordinates[-1])
         randomizer = self.sample_transport_randomizers((self.n_particles,), generator)
         perturbed_terminal_coordinate = self.transport_coordinate(coordinates[-1], randomizer, lambda_)
-        perturbed_terminal_law = self.population_law(perturbed_terminal_coordinate)
+        perturbed_terminal_law = terminal_law if self.horizon == 0 else self.population_law(perturbed_terminal_coordinate)
         terminal_reward = self.env.terminal_reward(states, perturbed_terminal_law)
-        base_terminal_reward = self.env.terminal_reward(base_states, terminal_law)
         perturbed_coordinates.append(perturbed_terminal_coordinate)
 
         returns = torch.stack(self.discounted_returns(rewards, terminal_reward))
-        base_return = self.discounted_returns(base_rewards, base_terminal_reward)[0]
-        advantages = returns - returns.mean(dim=1, keepdim=True) if self.config.baseline else returns
+        sampled_return = self.discounted_returns(rewards, terminal_reward)[0].detach()
+        advantages = independent_return_advantages(returns, dim=1) if self.config.baseline else returns
         action_gradient = self.flat_grad((torch.stack(action_log_probs) * advantages[:-1].detach()).sum())
-        return action_gradient, advantages.detach(), perturbed_coordinates, base_return.mean()
+        return action_gradient, advantages.detach(), perturbed_coordinates, sampled_return.mean()
 
     def combine_batched_trajectory_components(
         self, action_gradient, weights, perturbed_coordinates, sensitivities, coordinates, lambda_=None
     ):
         lambda_ = self.lambda_ if lambda_ is None else lambda_
         # Scores of every time at once; sum_b w_b s_b^T D_t = (sum_b w_b s_b)^T D_t.
-        perturbed = torch.stack(perturbed_coordinates)
-        base = torch.stack(list(coordinates[: perturbed.shape[0]])).unsqueeze(1)
+        if len(perturbed_coordinates) == 1:
+            return action_gradient / self.n_particles
+        perturbed = torch.stack(perturbed_coordinates[1:])
+        base = torch.stack(list(coordinates[1:])).unsqueeze(1)
         scores = self.transport_scores(perturbed, base, lambda_)
-        weighted = (weights.unsqueeze(-1) * scores).sum(dim=1)
-        law_gradient = torch.einsum("tq,tqp->p", weighted, torch.stack(list(sensitivities[: perturbed.shape[0]])))
+        weighted = (weights[1:].unsqueeze(-1) * scores).sum(dim=1)
+        law_gradient = torch.einsum("tq,tqp->p", weighted, torch.stack(list(sensitivities[1:])))
         return (action_gradient + law_gradient) / self.n_particles
 
     def batched_trajectory_gradient(self, coordinates, sensitivities, seed):
-        action_gradient, weights, perturbed_coordinates, base_return = self.batched_trajectory_components(coordinates, seed)
+        action_gradient, weights, perturbed_coordinates, sampled_return = self.batched_trajectory_components(coordinates, seed)
         gradient = self.combine_batched_trajectory_components(
             action_gradient,
             weights,
@@ -1144,7 +1196,7 @@ class ContinuousTransport:
             sensitivities,
             coordinates,
         )
-        return gradient, base_return
+        return gradient, sampled_return
 
     def estimate_gradient(self, seed):
         self.sensitivity_fallbacks = 0
@@ -1178,7 +1230,7 @@ class ContinuousTransport:
         if self.config.baseline:
             scores = torch.stack(scores)
             returns = torch.stack(returns)
-            returns = returns - returns.mean(dim=0, keepdim=True)
+            returns = independent_return_advantages(returns, dim=0)
             gradient = (scores * returns.detach().unsqueeze(-1)).sum(dim=(0, 1))
 
         gradient = gradient / self.n_particles

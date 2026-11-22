@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import torch
 
-from .randomizers import resolve
+from .randomizers import LawRandomizer, resolve
 
 
 @dataclass(frozen=True)
@@ -94,13 +94,13 @@ class LQ:
 
         for t in range(self.config.T):
             theta1, theta2 = theta[t]
-            law_variance = randomizer.variance(lambda_)
+            law_variance = 0.0 if t == 0 else randomizer.variance(lambda_)
             represented.append(
                 (self.config.a + self.config.b * theta1 + self.config.b * theta2 + self.config.c) * represented[t]
             )
             mean.append(
                 (self.config.a + self.config.b * theta1) * mean[t]
-                + (self.config.b * theta2 + self.config.c) * kappa * represented[t]
+                + (self.config.b * theta2 + self.config.c) * (represented[t] if t == 0 else kappa * represented[t])
             )
             variance.append(
                 (self.config.a + self.config.b * theta1).square() * variance[t]
@@ -131,8 +131,8 @@ class LQ:
             theta1, theta2 = theta[t]
             # Second moments of the two quantities the cost sees: the state and
             # the randomized population mean, which are independent.
-            law_mean = kappa * represented[t]
-            law_second = law_mean.square() + resolved.variance(lambda_)
+            law_mean = represented[t] if t == 0 else kappa * represented[t]
+            law_second = law_mean.square() + (0.0 if t == 0 else resolved.variance(lambda_))
             state_second = Sigma[t] + mu[t].square()
             objective = objective + self.config.q * state_second
             objective = objective + self.config.r * (
@@ -143,13 +143,21 @@ class LQ:
             )
             objective = objective + self.config.gamma * law_second
 
-        terminal_mean = kappa * represented[-1]
-        terminal_second = terminal_mean.square() + resolved.variance(lambda_)
+        terminal_mean = represented[-1] if self.config.T == 0 else kappa * represented[-1]
+        terminal_second = terminal_mean.square() + (0.0 if self.config.T == 0 else resolved.variance(lambda_))
         objective = objective + self.config.q_T * (Sigma[-1] + mu[-1].square())
         objective = objective + self.config.gamma_T * terminal_second
         return objective
 
-    def exact_gradient(self, theta, lambda_=None):
+    def exact_gradient(self, theta, lambda_=None, randomizer=None):
+        """Reference derivative of objective(), with the same randomizer convention."""
+        with torch.enable_grad():
+            parameter = theta if theta.requires_grad else theta.detach().requires_grad_(True)
+            value = self.objective(parameter, lambda_=lambda_, randomizer=randomizer)
+            gradient = torch.autograd.grad(value, parameter, create_graph=theta.requires_grad)[0]
+        return gradient
+
+    def exact_additive_gradient(self, theta, lambda_=None):
         """Analytic gradient of the objective under the additive convention.
 
         This adjoint recursion is written for the reference's additive
@@ -158,7 +166,7 @@ class LQ:
         directly, which is what the estimators and scripts/decomposition.py do.
         """
         lambda_ = self.config.perturbation_scale if lambda_ is None else lambda_
-        mu, Sigma = self.moment_flow(theta, lambda_)
+        mu, Sigma = self.moment_flow(theta, lambda_, randomizer=LawRandomizer(kind="additive", sigma=self.config.rho))
         p = torch.empty(self.config.T + 1, dtype=self.dtype, device=self.device)
         s = torch.empty(self.config.T + 1, dtype=self.dtype, device=self.device)
 
@@ -186,13 +194,12 @@ class LQ:
             )
             grad[t, 1] = (
                 2.0 * self.config.r * (theta1 + theta2) * mu[t].square()
-                + 2.0 * self.config.r * theta2 * lambda_**2 * self.config.rho**2
+                + 2.0 * self.config.r * theta2 * (0.0 if t == 0 else lambda_**2 * self.config.rho**2)
                 + self.config.b * mu[t] * p[t + 1]
                 + 2.0
                 * self.config.b
                 * (self.config.b * theta2 + self.config.c)
-                * lambda_**2
-                * self.config.rho**2
+                * (0.0 if t == 0 else lambda_**2 * self.config.rho**2)
                 * s[t + 1]
             )
 

@@ -1,7 +1,7 @@
 """How a randomized population law reaches a controlled particle.
 
 The continuous benchmarks read the population only through its mean, so every
-randomization reaches them as
+randomization at t >= 1 reaches them as
 
     M_t = kappa(lambda) m_t + lambda B_t,
 
@@ -10,9 +10,10 @@ with m_t the represented flow and B_t the randomizer's own draw:
     additive   kappa = 1,        Var(B_t) = rho^2
     mixture    kappa = 1-lambda, Var(B_t) = sigma^2
 
-`additive` is the analytic convention of the reference and belongs to no
-estimator; it is the default so that existing gradients and sweeps are
-unchanged. `mixture` is what both continuous estimators run: the mean is
+`additive` is an optional analytic convention and belongs to no estimator.
+The default is the mixture mean perturbation of equation 13. In both
+conventions M_0 = mu_0 is exact and receives no randomization. Both continuous
+estimators use `mixture`: the mean is
 carried to a random target, so the randomized law is centred on a shrunken
 mean and the controlled particle no longer reproduces the flow it is shown.
 That is why the moment recursions carry the represented flow and the particle's
@@ -26,7 +27,7 @@ from dataclasses import dataclass
 class LawRandomizer:
     """Mean and variance of the randomized population mean at one time."""
 
-    kind: str = "additive"
+    kind: str = "mixture"
     sigma: float = 1.0
 
     def __post_init__(self):
@@ -41,8 +42,8 @@ class LawRandomizer:
 
 
 def resolve(randomizer, rho):
-    """The randomizer to use, defaulting to the additive convention."""
-    return LawRandomizer(kind="additive", sigma=rho) if randomizer is None else randomizer
+    """Default to equation 13; additive noise must be requested explicitly."""
+    return LawRandomizer(kind="mixture", sigma=rho) if randomizer is None else randomizer
 
 
 def randomizer_for_run(metadata):

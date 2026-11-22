@@ -18,6 +18,17 @@ import torch
 from .sampling import sample_accepts_time
 
 
+def initial_population_law(env):
+    """Exact population argument of the known, fixed initial law mu_0."""
+    if hasattr(env, "initial_population_law"):
+        return env.initial_population_law()
+    if hasattr(env, "initial_distribution"):
+        return env.initial_distribution
+    if hasattr(env, "initial_law"):
+        return env.initial_law[0]
+    raise TypeError("The environment must expose its exact initial population argument.")
+
+
 def particle_law(env, states):
     """Population argument of the particle system: the empirical law, as each benchmark reads it."""
     if hasattr(env, "empirical_law"):
@@ -29,6 +40,8 @@ def particle_law(env, states):
 
 
 def particle_actions(env, policy, policy_time, t, states, law, generator):
+    if getattr(policy, "is_stationary_actor", False):
+        return policy.sample_actions(states, generator)
     if hasattr(env, "sample_action"):
         return env.sample_action(policy, t, states, law, generator)
     action_law = env.policy(policy, policy_time(t), states, law)
@@ -74,7 +87,8 @@ def finite_objective(env, policy, policy_time, discount, n_particles, horizon, g
     factor = 1.0
     for t in range(horizon):
         law = counts / total
-        probabilities = env.policy(policy, policy_time(t), states, law).clamp_min(1e-12)
+        probabilities = (policy.distribution(states).probs if getattr(policy, "is_stationary_actor", False)
+                         else env.policy(policy, policy_time(t), states, law)).clamp_min(1e-12)
         probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
         pair_counts = multinomial_counts(counts, probabilities, generator).reshape(-1)
         value = value + factor * (pair_counts * env.reward(pair_states, law, pair_actions)).sum() / total

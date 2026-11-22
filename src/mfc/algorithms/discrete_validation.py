@@ -6,7 +6,8 @@ def mean_field_next_law(env, policy, policy_time, t, law):
     with torch.no_grad():
         for state_index in range(env.n_states):
             state = torch.tensor(state_index, dtype=torch.long, device=env.device)
-            action_probabilities = env.policy(policy, policy_time(t), state, law)
+            action_probabilities = (policy.distribution(state).probs if getattr(policy, "is_stationary_actor", False)
+                                    else env.policy(policy, policy_time(t), state, law))
             for action_index in range(env.n_actions):
                 action = torch.tensor(action_index, dtype=torch.long, device=env.device)
                 transition = env.transition(state, law, action)
@@ -19,7 +20,8 @@ def expected_reward(env, policy, policy_time, t, law):
     with torch.no_grad():
         for state_index in range(env.n_states):
             state = torch.tensor(state_index, dtype=torch.long, device=env.device)
-            action_probabilities = env.policy(policy, policy_time(t), state, law)
+            action_probabilities = (policy.distribution(state).probs if getattr(policy, "is_stationary_actor", False)
+                                    else env.policy(policy, policy_time(t), state, law))
             for action_index in range(env.n_actions):
                 action = torch.tensor(action_index, dtype=torch.long, device=env.device)
                 value = value + law[state_index] * action_probabilities[action_index] * env.reward(state, law, action)

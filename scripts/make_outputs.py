@@ -39,6 +39,9 @@ from mfc.environments import (
     Advertising,
     AdvertisingConfig,
     AdvertisingPolicy,
+    Traffic,
+    TrafficConfig,
+    TrafficPolicy,
     Bimodal,
     BimodalConfig,
     Cybersecurity,
@@ -52,18 +55,19 @@ from mfc.environments import (
     TwoState,
     TwoStateConfig,
 )
-from mfc.visualization import load_runs, objective_table, runtime_table
+from mfc.visualization import learned_flow, load_runs, objective_table, runtime_table
 from mfc.visualization.constants import ENVIRONMENTS as ENVIRONMENT_CLASSES
 from mfc.visualization.io import dataclass_from_dict
 
 
-BENCHMARKS = ["twostate", "cybersecurity", "distribution", "advertising", "lq", "portfolio", "bimodal"]
+BENCHMARKS = ["traffic", "twostate", "cybersecurity", "distribution", "advertising", "lq", "portfolio", "bimodal"]
 # Continuous-state benchmarks carry the mixture chart and the Gaussian-manifold
 # arm; the other groups name the figure each set of benchmarks appears on.
 CONTINUOUS_ENVS = ["lq", "portfolio"]
 MAIN_ENVS = ["twostate", "distribution", "lq", "portfolio", "bimodal"]
-APPENDIX_ENVS = ["cybersecurity", "advertising"]
+APPENDIX_ENVS = ["cybersecurity", "advertising", "traffic"]
 DISPLAY = {
+    "traffic": "Traffic",
     "twostate": "Two-state",
     "cybersecurity": "Cybersecurity",
     "distribution": "Distribution",
@@ -77,6 +81,7 @@ DISPLAY = {
 # its single-Gaussian arm is drawn beside it as "Transport, K=1".
 TRANSPORT_COMPONENTS = {"lq": 1, "portfolio": 1, "bimodal": 2}
 MAIN_FLOW = {
+    "traffic": "particle",
     "twostate": "particle",
     "cybersecurity": "particle",
     "distribution": "particle",
@@ -99,17 +104,17 @@ LEARNING_PANELS = {
     "Advertising": ("advertising", 1.018750),
 }
 METHOD_COLOR = {"REINFORCE": "#eb6834", "MF-REINFORCE": "#eda100", "Transport": "#2a78d6",
-                "Transport-Proba": "#7b3fbf", "Transport, K=1": "#8fb8e8", "Finite differences": "#b5446e"}
+                "Transport-Proba": "#7b3fbf", "Transport, K=1": "#8fb8e8", "Finite differences": "#b5446e",
+                "IH-MFC-AC": "#1baf7a"}
 METHOD_MARKER = {"REINFORCE": "s", "MF-REINFORCE": "D", "Transport": "o", "Transport-Proba": "^",
                  "Transport, K=1": "v", "Finite differences": "P"}
 OPTIMAL = "#52514e"
-MFQ_COLOR = "#1baf7a"
 # One colour and marker per benchmark, shared by every diagnostic figure.
-ENV_COLOR = {"lq": "#2a78d6", "portfolio": "#eb6834", "bimodal": "#7b3fbf", "twostate": "#1baf7a",
+ENV_COLOR = {"traffic": "#6b705c", "lq": "#2a78d6", "portfolio": "#eb6834", "bimodal": "#7b3fbf", "twostate": "#1baf7a",
              "distribution": "#eda100", "cybersecurity": "#e87ba4", "advertising": "#008300"}
-ENV_MARKER = {"lq": "o", "portfolio": "s", "bimodal": "X", "twostate": "^", "distribution": "D",
+ENV_MARKER = {"traffic": "h", "lq": "o", "portfolio": "s", "bimodal": "X", "twostate": "^", "distribution": "D",
               "cybersecurity": "v", "advertising": "P"}
-ENV_SHORT = {"lq": "Linear-quadratic", "portfolio": "Portfolio", "bimodal": "Bimodal", "twostate": "Two-state",
+ENV_SHORT = {"traffic": "Traffic", "lq": "Linear-quadratic", "portfolio": "Portfolio", "bimodal": "Bimodal", "twostate": "Two-state",
              "distribution": "Distribution", "cybersecurity": "Cybersecurity", "advertising": "Advertising"}
 GRID, INK, MUTED = "#d8d7d2", "#0b0b0b", "#52514e"
 
@@ -141,19 +146,30 @@ def env_dir(results_root, env):
     return direct
 
 
+def current_traffic_protocol(metadata):
+    """Avoid pooling old Dirichlet and current mixed-law experiments."""
+    config = metadata["env_config"]
+    default = TrafficConfig()
+    family = config.get("training_initial_law", "dirichlet")
+    return (family == default.training_initial_law
+            and config.get("congestion_reward", "local") == default.congestion_reward
+            and config.get("precision", "float32") == default.precision
+            and (family != "mixed" or config.get("training_jam_probability", .5) == default.training_jam_probability))
+
+
 def has_run(results_root, env):
+    if env == "traffic":
+        return bool(load_env_runs(results_root, env))
     return any(env_dir(results_root, env).glob("*/history.json"))
 
 
 def load_env_runs(results_root, env):
-    """Budget-matched runs of one benchmark.
-
-    The converged tabular reference is not budget matched, so it is kept out of
-    the comparison tables and read only by mfq_reference.
-    """
+    """Active runs of one benchmark (historical Q-learning is excluded by load_runs)."""
     directory = env_dir(results_root, env)
     runs = load_runs(directory.parent, env=directory.name) if directory.name == env else load_runs(directory)
-    return [run for run in runs if not run["path"].name.startswith("mfqlearning_converged")]
+    if env == "traffic":
+        runs = [run for run in runs if current_traffic_protocol(run["metadata"])]
+    return runs
 
 
 def transport_stem(results_root, env, flow=None, components=None):
@@ -170,6 +186,8 @@ def transport_stem(results_root, env, flow=None, components=None):
     for path in env_dir(results_root, env).glob(f"transport_*{suffix}_seed_*"):
         summary = path / "summary.json"
         if not summary.exists():
+            continue
+        if env == "traffic" and not current_traffic_protocol(json.loads((path / "metadata.json").read_text())):
             continue
         stem = re.sub(r"_seed_\d+$", "", path.name)
         if components is not None and f"_K_{components}_" not in stem:
@@ -243,6 +261,18 @@ def run_stems(results_root, env, include_gaussian=False):
         stems["MF-REINFORCE"] = f"mfreinforce_eps_2_T_{horizon}_particle"
     elif env == "advertising":
         stems["MF-REINFORCE"] = f"mfreinforce_eps_1_T_{horizon}_particle"
+    elif env == "traffic":
+        epsilon = run_plan.MF_REINFORCE_EPSILON[env]
+        stems["MF-REINFORCE"] = f"mfreinforce_eps_{epsilon:g}_T_{horizon}_particle"
+    if env == "traffic":
+        config = TrafficConfig()
+        suffix = (f"_reward_{config.congestion_reward}" if config.congestion_reward != "local" else "")
+        suffix += "_fp64" if config.precision == "float64" else ""
+        suffix += f"_init_{config.training_initial_law}"
+        if config.training_initial_law == "mixed":
+            suffix += f"_p_{config.training_jam_probability:g}"
+        if config.training_initial_law != "dirichlet":
+            stems = {name: stem.replace("_T_", suffix + "_T_", 1) for name, stem in stems.items()}
     stem = transport_stem(results_root, env, components=TRANSPORT_COMPONENTS.get(env))
     if stem is not None:
         stems["Transport"] = stem
@@ -268,7 +298,7 @@ def optimal_policy_of(name, env):
     """The benchmark's optimal policy, or None where it has no reference (cybersecurity)."""
     key = (name, env.config.T, getattr(env.config, "T_val", None))
     if key not in _OPTIMAL_POLICIES:
-        if name == "cybersecurity":
+        if name in {"cybersecurity", "traffic"}:
             policy = None
         elif name in {"distribution", "advertising"}:
             policy = env.optimal_policy()
@@ -413,7 +443,72 @@ def figure_legend(figure, axes, order, ncol):
 
 
 FLOW_ORDER = (r"$\theta^\star$", "Transport", "Transport, K=1", "Transport-Proba", "Finite differences",
-              "MF-REINFORCE", "REINFORCE", r"$\mathcal{N}(0,1)$")
+              "MF-REINFORCE", "REINFORCE", "IH-MFC-AC", r"$\mathcal{N}(0,1)$")
+
+
+def ihmfc_runs(results_root, env):
+    """Best saved IH-MFC-AC configuration, keeping all its paired seeds."""
+    horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
+    candidates = {}
+    for path in env_dir(results_root, env).glob(f"ihmfcac_*_T_{horizon}_particle_seed_*"):
+        if not (path / "summary.json").exists():
+            continue
+        if env == "traffic" and not current_traffic_protocol(json.loads((path / "metadata.json").read_text())):
+            continue
+        value = json.loads((path / "summary.json").read_text()).get("last_validation_objective")
+        if value is not None:
+            candidates.setdefault(re.sub(r"_seed_\d+$", "", path.name), []).append((path, value))
+    if not candidates:
+        return []
+    best = max(candidates.values(), key=lambda paths: np.mean([value for _, value in paths]))
+    return [run for path, _ in sorted(best) for run in load_runs(path)]
+
+
+def draw_ihmfc_learning(ax, results_root, env, gap=True):
+    """Use actual recorded iterations and K+1 costs, not Transport's update axis."""
+    observations = []
+    for run in ihmfc_runs(results_root, env):
+        history, metadata = run["history"], run["metadata"]
+        reference = run_optimum(run["path"]) if gap else None
+        if gap and reference is None:
+            reference = OPTIMUM_OF[env]
+        for step, value in zip(history["validation_steps"], history["validation_objective"]):
+            value = max(abs(value - reference), 1e-12) if gap else value
+            observations.append((step * metadata["simulator_budget_estimate"], value))
+    if not observations:
+        return
+    summary = pd.DataFrame(observations, columns=["transitions", "value"]).groupby("transitions")["value"].agg(["mean", "std"]).fillna(0)
+    x, y, sd = summary.index.to_numpy() / 1e6, summary["mean"].to_numpy(), summary["std"].to_numpy()
+    lower = np.maximum(y - sd, 1e-12) if gap else y - sd
+    old_limits = ax.get_ylim()
+    ax.plot(x, y, color=METHOD_COLOR["IH-MFC-AC"], linewidth=1.1, label="IH-MFC-AC")
+    ax.fill_between(x, lower, y + sd, color=METHOD_COLOR["IH-MFC-AC"], alpha=0.20, linewidth=0)
+    if gap:
+        ax.set_ylim(min(old_limits[0], float(lower.min()) * 0.6), max(old_limits[1], float((y + sd).max()) * 1.6))
+
+
+def draw_ihmfc_flow(ax, results_root, env):
+    runs = ihmfc_runs(results_root, env)
+    if not runs:
+        return
+    run = next((run for run in runs if run["metadata"]["seed"] == 0), runs[0])
+    horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
+    flow = learned_flow(run, horizon=horizon, device="cpu").numpy()
+    if env == "traffic":
+        simulator = Traffic(TrafficConfig(device="cpu"))
+        x = np.arange(flow.shape[0])
+        y = np.einsum("ti,ij,tj->t", flow, simulator.risk_matrix.numpy(), flow)
+    elif env == "distribution":
+        x, y = np.arange(flow.shape[1]), flow[-1]
+    else:
+        x = np.arange(flow.shape[0])
+        if env == "lq":
+            y = np.maximum(np.abs(flow[:, 0]), 1e-6)
+        elif env == "cybersecurity":
+            y = flow[:, 0] + flow[:, 2]
+        else:
+            y = flow[:, 1]
+    ax.plot(x, y, color=METHOD_COLOR["IH-MFC-AC"], linewidth=1.1, label="IH-MFC-AC")
 
 
 def tensor_policy(path):
@@ -592,10 +687,16 @@ def main_benchmarks(results_root, output):
     for index, env in enumerate(envs):
         draw_learning_panel(axes[0, index], results_root, env, include_gaussian=True, against="calls",
                             subtitle=False)
+        draw_ihmfc_learning(axes[0, index], results_root, env)
         FLOW_PANEL[env](axes[1, index], results_root, include_gaussian=True)
+        draw_ihmfc_flow(axes[1, index], results_root, env)
         axes[0, index].set_title(ENV_SHORT[env], fontsize=7.4, color=INK, pad=4)
+        axes[0, index].set_ylabel("Optimality gap", fontsize=7.5)
         # The flow panels are identified by their column; keep only what they show.
-        axes[1, index].set_title(axes[1, index].get_title().split(": ", 1)[-1], fontsize=6.8, color=MUTED, pad=3)
+        flow_ax = axes[1, index]
+        flow_title = flow_ax.get_title().split(": ", 1)[-1]
+        flow_ax.set_title(f"{flow_title} {flow_ax.get_ylabel()}", fontsize=6.8, color=MUTED, pad=3)
+        flow_ax.set_ylabel("")
     for env in ("lq", "twostate"):
         if env in envs:
             # Gaps spanning three decades collide under the shared (1, 2, 5) locator.
@@ -619,23 +720,11 @@ def main_benchmarks(results_root, output):
     save_figure(figure, output)
 
 
-# The tabular reference is the converged MFQ run, not the budget-matched one.
-MFQ_REFERENCE_STEM = "mfqlearning_converged_*_seed_*"
-
-
 def mlp_policy(module, folder):
     blob = torch.load(Path(folder) / "policy.pt", map_location="cpu", weights_only=False)
     module.load_state_dict(blob["state_dict"])
     module.eval()
     return lambda t, mu: module(torch.tensor(float(t)), mu)
-
-
-def mfq_reference(results_root, env):
-    values = [
-        json.loads(path.read_text())["last_validation_objective"]
-        for path in sorted(env_dir(results_root, env).glob(f"{MFQ_REFERENCE_STEM}/summary.json"))
-    ]
-    return float(np.mean(values)) if values else None
 
 
 def appendix_benchmarks(results_root, output):
@@ -664,11 +753,7 @@ def appendix_benchmarks(results_root, output):
         optimum = REFERENCE_OPTIMUM.get((env, run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]))
         if optimum is not None:
             ax.axhline(optimum, color=OPTIMAL, linewidth=1.0, dashes=(3, 2), label=r"$\theta^\star$")
-        elif env == "cybersecurity":
-            reference = mfq_reference(results_root, env)
-            if reference is not None:
-                # A separate style: the tabular reference is not an optimum, only a baseline.
-                ax.axhline(reference, color=MFQ_COLOR, linewidth=1.0, dashes=(1, 1.6), label="MFQ-learning")
+        draw_ihmfc_learning(ax, results_root, env, gap=False)
         ax.set_title(DISPLAY[env].replace("--", "-"), fontsize=8, color=INK, pad=12)
         ax.text(0.5, 1.015, scale_label(results_root, env), transform=ax.transAxes,
                 ha="center", va="bottom", fontsize=6.4, color=MUTED)
@@ -679,7 +764,13 @@ def appendix_benchmarks(results_root, output):
     for column, env in enumerate(envs):
         ax = axes[1, column]
         directory = env_dir(results_root, env)
-        if env == "cybersecurity":
+        if env == "traffic":
+            simulator = Traffic(TrafficConfig(device="cpu"))
+            module_class, config = TrafficPolicy, simulator.config
+            readout = lambda law: float(law @ simulator.risk_matrix @ law)
+            title, ylabel = "Traffic: proximity risk", r"$\mu_t^\top R\mu_t$"
+            optimal_theta = None
+        elif env == "cybersecurity":
             simulator = Cybersecurity(CybersecurityConfig(T=3, device="cpu"))
             module_class, config = CybersecurityPolicy, simulator.config
             readout = lambda law: float(law[simulator.DI] + law[simulator.UI])
@@ -713,6 +804,7 @@ def appendix_benchmarks(results_root, output):
             ax.plot(steps, trace(mlp_policy(module_class(config), folder)),
                     color=METHOD_COLOR[method], linewidth=1.1,
                     marker=METHOD_MARKER[method], markersize=3.0, label=method)
+        draw_ihmfc_flow(ax, results_root, env)
         ax.set_title(title, fontsize=8, color=INK, pad=3)
         ax.set_xlabel("$t$", fontsize=7.5)
         ax.set_ylabel(ylabel, fontsize=7.5)
@@ -723,7 +815,7 @@ def appendix_benchmarks(results_root, output):
     for ax in axes.ravel():
         for handle, label in zip(*ax.get_legend_handles_labels()):
             found.setdefault(label, handle)
-    order = [name for name in ("REINFORCE", "MF-REINFORCE", "Transport", r"$\theta^\star$", "MFQ-learning") if name in found]
+    order = [name for name in ("REINFORCE", "MF-REINFORCE", "Transport", r"$\theta^\star$") if name in found]
     order += [name for name in found if name not in order]
     figure.legend([found[name] for name in order], order, loc="outside lower center",
                   ncol=len(order), frameon=False, handlelength=1.8)
@@ -903,7 +995,7 @@ def theory_verification(estimate_csv, consistency_csv, output):
     if not Path(estimate_csv).exists() or not Path(consistency_csv).exists():
         print("skipping theory_verification: diagnostic CSVs not found")
         return
-    order = ["lq", "portfolio", "bimodal", "twostate", "distribution", "cybersecurity", "advertising"]
+    order = ["lq", "portfolio", "bimodal", "twostate", "distribution", "cybersecurity", "advertising", "traffic"]
     figure, axes = plt.subplots(1, 2, figsize=(5.5, 2.35), constrained_layout=True)
     draw_perturbation_estimate(axes[0], estimate_csv, order)
     axes[0].set_title("(a) perturbation estimate", fontsize=8, color=INK, pad=4)
@@ -1222,8 +1314,8 @@ def method_of(label):
         return "reinforce"
     if label.startswith("Transport-Proba"):
         return "gaussian"
-    if label.startswith("MFQ-learning"):
-        return "mfqlearning"
+    if label.startswith("IH-MFC-AC"):
+        return "ihmfcac"
     if label.startswith("MF-REINFORCE"):
         return "mfreinforce"
     if label.startswith("Finite differences"):
@@ -1356,7 +1448,7 @@ ESTIMATORS = [
     ("transport", "Transport"),
     ("gaussian", "Transport-Proba"),
     ("finitediff", "Finite differences"),
-    ("mfqlearning", "MFQ-learning"),
+    ("ihmfcac", "IH-MFC-AC"),
 ]
 SCALE_COUNT = {"transport": "$\\lambda,\\eta$", "gaussian": "$\\lambda$"}
 
@@ -1381,7 +1473,7 @@ def runtime_rows(results_root, env, scales_column):
         if scales_column:
             cells.append(SCALE_COUNT.get(algorithm, "---"))
         cells += [
-            f"${float(row['simulator_budget_mean']):,.0f}$".replace(",", "\\,"),
+            f"${float(row['total_simulator_transitions_mean']):,.0f}$".replace(",", "\\,"),
             f"${seconds:,.0f}$".replace(",", "\\,"),
             "---" if reference_seconds is None else f"${seconds / reference_seconds:.1f}\\times$",
         ]

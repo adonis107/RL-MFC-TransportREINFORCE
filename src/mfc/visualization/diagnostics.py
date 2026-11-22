@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pandas as pd
 import torch
@@ -86,31 +86,21 @@ def build_estimator(run, seed, n_particles=None, baseline=True, **overrides):
         reuse_state_gradient=algorithm_config.get("reuse_state_gradient", True),
         seed=seed,
     )
-    if metadata["env"] in CONTINUOUS_ENVS:
-        config = ContinuousTransportConfig(
-            **common,
-            n_law_gradient=algorithm_config.get("n_law_gradient"),
-            n_law_particles=algorithm_config.get("n_law_particles"),
-            n_components=algorithm_config.get("n_components") or ContinuousTransportConfig.n_components,
-        )
-        return env, policy, ContinuousTransport(env, policy=policy, config=replace(config, **overrides))
-
-    config = DiscreteTransportConfig(
-        **common,
-        n_logit_gradient=algorithm_config.get("n_logit_gradient"),
-        simplex_sigma=algorithm_config.get("simplex_sigma", DiscreteTransportConfig.simplex_sigma),
-    )
-    return env, policy, DiscreteTransport(env, policy=policy, config=replace(config, **overrides))
+    config_class = DiscreteTransportConfig if hasattr(env, "n_states") else ContinuousTransportConfig
+    saved = {field.name: algorithm_config[field.name] for field in fields(config_class)
+             if field.name in algorithm_config}
+    saved.update(common)
+    config = replace(config_class(**saved), **overrides)
+    estimator_class = DiscreteTransport if hasattr(env, "n_states") else ContinuousTransport
+    return env, policy, estimator_class(env, policy=policy, config=config)
 
 
 def mixture_identification(estimator, seed):
     """Conditioning of the mixture score Jacobian A along the represented flow.
 
-    A is inverted once per time step from t = 1 on, so the summary covers those
-    matrices. A singular direction below the estimator's floor is dropped by the
-    sensitivity solve, and the retained fraction is therefore how much of the
-    chart the population law actually identifies: it falls well below one exactly
-    when K asks for more components than the law needs.
+    This is an identification diagnostic for t >= 1; the centered-difference
+    sensitivity estimator does not invert these matrices. The retained fraction
+    reports how many chart directions exceed the diagnostic threshold.
     """
     _, jacobians = estimator.population_coordinates(seed=seed)
     spectra = [torch.linalg.svdvals(jacobian) for jacobian in jacobians[1:]]

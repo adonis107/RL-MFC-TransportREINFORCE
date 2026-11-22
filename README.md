@@ -35,8 +35,8 @@ uv run python scripts/train.py \
 ```
 
 Environments are `twostate`, `cybersecurity`, `distribution`, `advertising`, `lq`,
-`portfolio` and `bimodal`. Algorithms are `reinforce`, `mfreinforce`, `transport`,
-`gaussian`, `finitediff` and `mfqlearning`. `finitediff` takes its step as
+`portfolio`, `bimodal` and `traffic`. Algorithms are `reinforce`, `mfreinforce`, `transport`,
+`gaussian`, `finitediff` and `ihmfcac`. `finitediff` takes its step as
 `--perturbation`; `--common-random-numbers` drives both systems of a coordinate with
 the same draws.
 

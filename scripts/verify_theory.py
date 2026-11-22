@@ -51,19 +51,24 @@ def discrete_flow(env, algorithm, horizon, laws=None):
     law = env.initial_distribution.clone()
     objective = torch.zeros((), dtype=env.dtype, device=env.device)
     discount = 1.0
+    population = law
     for t in range(horizon):
-        argument = law if laws is None else (1.0 - laws[1]) * law + laws[1] * laws[0][t]
+        argument = population if laws is None or t == 0 else (1.0 - laws[1]) * population + laws[1] * laws[0][t]
         nxt = torch.zeros_like(law)
+        population_next = torch.zeros_like(population)
         for x in range(env.n_states):
             state = torch.tensor(x, dtype=torch.long, device=env.device)
             probabilities = env.policy(algorithm.policy, algorithm.policy_time(t), state, argument)
+            base_probabilities = env.policy(algorithm.policy, algorithm.policy_time(t), state, population)
             for a in range(env.n_actions):
                 action = torch.tensor(a, dtype=torch.long, device=env.device)
                 objective = objective + discount * law[x] * probabilities[a] * env.reward(state, argument, action)
                 nxt = nxt + law[x] * probabilities[a] * env.transition(state, argument, action)
+                population_next = population_next + population[x] * base_probabilities[a] * env.transition(state, population, action)
         law = nxt / nxt.sum()
+        population = population_next / population_next.sum()
         discount = discount * algorithm.discount
-    argument = law if laws is None else (1.0 - laws[1]) * law + laws[1] * laws[0][horizon]
+    argument = population if laws is None or horizon == 0 else (1.0 - laws[1]) * population + laws[1] * laws[0][horizon]
     for x in range(env.n_states):
         state = torch.tensor(x, dtype=torch.long, device=env.device)
         objective = objective + discount * law[x] * env.terminal_reward(state, argument)
@@ -98,7 +103,7 @@ def v1_discrete(name, horizon, device, seed, draws):
     rows = []
     for lambda_ in LAMBDAS:
         worst = 0.0
-        for t, mu in enumerate(flow):
+        for mu in flow[1:]:
             q = estimator.sample_simplex_batch(draws, generator)
             # d_TV((1-l)mu + l q, mu) = l * d_TV(q, mu)
             ratio = 0.5 * (q - mu.unsqueeze(0)).abs().sum(dim=-1)
@@ -142,7 +147,7 @@ def v1_continuous(name, horizon, device, seed, draws):
     rows = []
     for lambda_ in LAMBDAS:
         squared_w1, squared_w2 = [], []
-        for z in coordinates:
+        for z in coordinates[1:]:
             base = cdf(z)
             base_quantile = quantile(base)
             randomizers = estimator.sample_transport_randomizers((draws,), generator)

@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from .discrete_validation import evaluate_law, mean_field_next_law
-from .sampling import sample_accepts_time
+from .sampling import independent_return_advantages, sample_accepts_time
 from .timing import report_progress, synchronized_time
 from .validation import monte_carlo_objective
 
@@ -19,7 +19,7 @@ class MFReinforceConfig:
     horizon: int | None = None
     validation_interval: int | None = None
     perturbation_eta: float | None = None
-    flow: str = "exact"
+    flow: str = "particle"
     n_flow_particles: int | None = None
     baseline: bool = True
     reuse_state_gradient: bool = True
@@ -175,10 +175,15 @@ class MFReinforce:
         return torch.nn.functional.one_hot(states, self.env.n_states).T.to(self.env.dtype)
 
     def sample_initial_distribution(self, generator):
+        # Sample once per training update, then share this law across its stages.
         if hasattr(self.env, "sample_initial_distribution"):
             return self.env.sample_initial_distribution(generator)
         return self.env.initial_distribution
 
+
+    def initial_population_argument(self, initial_distribution=None):
+        """Known initial law for prescribed-flow rollouts, never an empirical fit."""
+        return self.env.initial_distribution if initial_distribution is None else initial_distribution
 
     def initial_state(self, generator, initial_distribution=None):
         probabilities = self.sample_initial_distribution(generator) if initial_distribution is None else initial_distribution
@@ -275,9 +280,11 @@ class MFReinforce:
 
     def discounted_returns(self, rewards, terminal_reward):
         values = [None] * (len(rewards) + 1)
-        values[-1] = terminal_reward
+        # Absolute-time discounting is required when each tail multiplies its
+        # time-t score; a relative tail would omit the outer discount**t.
+        values[-1] = self.discount**len(rewards) * terminal_reward
         for t in range(len(rewards) - 1, -1, -1):
-            values[t] = rewards[t] + self.discount * values[t + 1]
+            values[t] = self.discount**t * rewards[t] + values[t + 1]
         return values
 
     def evaluate_law(self, initial_distribution, horizon):
@@ -317,8 +324,8 @@ class MFReinforce:
             rows = []
 
             for s in range(target_t):
-                law = laws[s]
-                perturbed_law = self.perturbed_law(log_laws[s].unsqueeze(0), noises[s])
+                law = self.initial_population_argument(initial_distribution) if s == 0 else laws[s]
+                perturbed_law = self.initial_population_argument(initial_distribution).expand_as(noises[s]) if s == 0 else self.perturbed_law(log_laws[s].unsqueeze(0), noises[s])
 
                 base_actions, _ = self.sample_actions_with_log_probs(
                     s, base_states, law.expand(self.n_logit_gradient, -1), generator
@@ -327,7 +334,7 @@ class MFReinforce:
                     perturbed_actions, _ = self.sample_actions_with_log_probs(
                         s, perturbed_states, perturbed_law, generator
                     )
-                law_scores.append(noises[s])
+                law_scores.append(torch.zeros_like(noises[s]) if s == 0 else noises[s])
                 rows.append((s, perturbed_states, perturbed_law, perturbed_actions))
 
                 with torch.no_grad():
@@ -357,47 +364,37 @@ class MFReinforce:
         generator = torch.Generator(device=self.env.device)
         generator.manual_seed(seed)
 
-        base_state = self.initial_state(generator, initial_distribution)
         perturbed_state = self.initial_state(generator, initial_distribution)
         noises = torch.randn(
             self.horizon + 1, self.env.n_states, dtype=self.env.dtype, device=self.env.device, generator=generator
         )
-        rewards = []
         perturbed_rewards = []
         score_terms = []
 
         for t in range(self.horizon):
-            law = torch.softmax(log_laws[t], dim=0)
-            perturbed_law = self.perturbed_law(log_laws[t], noises[t])
+            perturbed_law = self.initial_population_argument(initial_distribution) if t == 0 else self.perturbed_law(log_laws[t], noises[t])
 
-            base_action, _ = self.sample_action(t, base_state, law, generator)
             perturbed_action, _ = self.sample_action(t, perturbed_state, perturbed_law, generator)
             law_score = noises[t] @ logit_gradients[t] / self.perturbation_eta
             action_score = self.log_prob_gradient(t, perturbed_state, perturbed_law, perturbed_action)
             score_terms.append(law_score + action_score)
 
-            rewards.append(self.env.reward(base_state, law, base_action))
             perturbed_rewards.append(self.env.reward(perturbed_state, perturbed_law, perturbed_action))
 
             with torch.no_grad():
-                base_state = self.sample_next_state(t, base_state, law, base_action, generator)
                 perturbed_state = self.sample_next_state(t, perturbed_state, perturbed_law, perturbed_action, generator)
 
-        terminal_law = torch.softmax(log_laws[-1], dim=0)
         perturbed_terminal_law = self.perturbed_law(log_laws[-1], noises[-1])
-        terminal_reward = self.env.terminal_reward(base_state, terminal_law)
         perturbed_terminal_reward = self.env.terminal_reward(perturbed_state, perturbed_terminal_law)
         score_terms.append(noises[-1] @ logit_gradients[-1] / self.perturbation_eta)
 
         returns = self.discounted_returns(perturbed_rewards, perturbed_terminal_reward)
-        base_returns = self.discounted_returns(rewards, terminal_reward)
-        return torch.stack(score_terms), torch.stack(returns), base_returns[0]
+        return torch.stack(score_terms), torch.stack(returns), returns[0].detach()
 
     def batched_trajectory_gradient(self, log_laws, logit_gradients, seed, initial_distribution=None):
         generator = torch.Generator(device=self.env.device)
         generator.manual_seed(seed)
 
-        base_states = self.initial_states(self.n_particles, generator, initial_distribution)
         perturbed_states = self.initial_states(self.n_particles, generator, initial_distribution)
         noises = torch.randn(
             self.horizon + 1,
@@ -407,47 +404,37 @@ class MFReinforce:
             device=self.env.device,
             generator=generator,
         )
-        rewards = []
         perturbed_rewards = []
         law_scores = []
         action_log_probs = []
 
         for t in range(self.horizon):
-            law = torch.softmax(log_laws[t], dim=0)
-            perturbed_law = self.perturbed_law(log_laws[t].unsqueeze(0), noises[t])
+            perturbed_law = self.initial_population_argument(initial_distribution).expand_as(noises[t]) if t == 0 else self.perturbed_law(log_laws[t].unsqueeze(0), noises[t])
 
-            base_actions, _ = self.sample_actions_with_log_probs(
-                t, base_states, law.expand(self.n_particles, -1), generator
-            )
             perturbed_actions, log_probs = self.sample_actions_with_log_probs(
                 t, perturbed_states, perturbed_law, generator
             )
-            law_scores.append(noises[t])
+            law_scores.append(torch.zeros_like(noises[t]) if t == 0 else noises[t])
             action_log_probs.append(log_probs)
 
-            rewards.append(self.env.reward(base_states, law, base_actions))
             perturbed_rewards.append(self.env.reward(perturbed_states, perturbed_law, perturbed_actions))
 
             with torch.no_grad():
-                base_states = self.sample_next_state(t, base_states, law, base_actions, generator)
                 perturbed_states = self.sample_next_state(t, perturbed_states, perturbed_law, perturbed_actions, generator)
 
-        terminal_law = torch.softmax(log_laws[-1], dim=0)
         perturbed_terminal_law = self.perturbed_law(log_laws[-1].unsqueeze(0), noises[-1])
-        terminal_reward = self.env.terminal_reward(base_states, terminal_law)
         perturbed_terminal_reward = self.env.terminal_reward(perturbed_states, perturbed_terminal_law)
         law_scores.append(noises[-1])
 
         returns = torch.stack(self.discounted_returns(perturbed_rewards, perturbed_terminal_reward))
-        advantages = returns - returns.mean(dim=1, keepdim=True) if self.config.baseline else returns
+        advantages = independent_return_advantages(returns, dim=1) if self.config.baseline else returns
         action_gradient = self.flat_grad((torch.stack(action_log_probs) * advantages[:-1].detach()).sum())
         weights = advantages.detach()
         law_gradient = torch.zeros(self.n_parameters, dtype=self.env.dtype, device=self.env.device)
         for index, noise in enumerate(law_scores):
             law_gradient = law_gradient + (noise.transpose(0, 1) @ weights[index]) @ logit_gradients[index]
         law_gradient = law_gradient / self.perturbation_eta
-        base_returns = self.discounted_returns(rewards, terminal_reward)
-        return (action_gradient + law_gradient) / self.n_particles, base_returns[0].mean()
+        return (action_gradient + law_gradient) / self.n_particles, returns[0].detach().mean()
 
     def estimate_gradient(self, seed):
         law_generator = torch.Generator(device=self.env.device)
@@ -496,7 +483,7 @@ class MFReinforce:
         if self.config.baseline:
             scores = torch.stack(scores)
             returns = torch.stack(returns)
-            advantages = returns - returns.mean(dim=0, keepdim=True)
+            advantages = independent_return_advantages(returns, dim=0)
             gradient = (scores * advantages.detach().unsqueeze(-1)).sum(dim=(0, 1))
 
         gradient = gradient / self.n_particles

@@ -7,11 +7,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN = ROOT / "scripts" / "train.py"
 
-PRIMARY_ENVS = ["twostate", "cybersecurity", "distribution", "advertising", "lq", "portfolio", "bimodal"]
-DISCRETE_ENVS = {"twostate", "cybersecurity", "distribution", "advertising"}
+PRIMARY_ENVS = ["traffic", "twostate", "cybersecurity", "distribution", "advertising", "lq", "portfolio", "bimodal"]
+DISCRETE_ENVS = {"traffic", "twostate", "cybersecurity", "distribution", "advertising"}
 CONTINUOUS_ENVS = {"lq", "portfolio", "bimodal"}
 
 DISCRETE_REFERENCE = {
+    "traffic": {"n_particles": 200, "n_gradient": 10},
     "twostate": {"n_particles": 200, "n_gradient": 10},
     "cybersecurity": {"n_particles": 200, "n_gradient": 1},
     "distribution": {"n_particles": 500, "n_gradient": 10},
@@ -24,9 +25,12 @@ DISCRETE_REFERENCE = {
 # and carried too little gradient signal for the selection to mean anything, so they keep the
 # published allocation of the reference configuration.
 # Best scales of the MF-REINFORCE reference; advertising, absent there, was screened in {0.5, 1, 2}.
-MF_REINFORCE_EPSILON = {"twostate": 0.2, "cybersecurity": 1.0, "distribution": 2.0, "advertising": 1.0}
+# Traffic epsilon=2 adopted after the paired seed-0 comparison; configs/traffic.json
+# records its provenance and the unchanged matched-budget allocation.
+MF_REINFORCE_EPSILON = {"traffic": 2.0, "twostate": 0.2, "cybersecurity": 1.0, "distribution": 2.0, "advertising": 1.0}
 
 MF_REINFORCE_SPLITS = {
+    "traffic": {"n_particles": 1012, "n_logit_gradient": 10},
     "twostate": {"n_particles": 20, "n_logit_gradient": 40},
     "distribution": {"n_particles": 260, "n_logit_gradient": 50},
 }
@@ -54,6 +58,12 @@ CONTINUOUS_COMPONENTS = {
 #               benchmark (d_theta = 1) instead gives each of its two systems 4000 particles,
 #               which its two-component fits need.
 TRANSPORT_ALLOCATIONS = {
+    # Shared congestion, 3 cells/lane, T=5, float64. Raw-gradient-MSE screen:
+    # results/traffic_shared_calibration/selection.json; matched cost 6360/update.
+    "traffic": {
+        "horizon": 5, "M": 200, "n": 536, "B": 536,
+        "updates": 10_000, "lr": 1e-3, "simplex_sigma": 0.5,
+    },
     "twostate": {
         "horizon": 5,
         "M": 200,
@@ -156,6 +166,7 @@ def effective_auxiliary_samples(env):
 # scripts/verify_bounds.py (continuous). Benchmarks absent here fall back to the asymptotic rule.
 LARGE_AUXILIARY_ETAS = (0.85, 0.95, 0.98)
 MEASURED_AUXILIARY_ETA = {
+    "traffic": 0.98,
     "twostate": 0.98,
     "cybersecurity": 0.98,
     "distribution": 0.98,
@@ -200,7 +211,7 @@ def transport_per_step_budget(env):
     return allocation["M"] + allocation["n"] + allocation["B"]
 
 
-def transport_job(env, flow="exact", lambda_=None, n_components=None, eta=None):
+def transport_job(env, flow="particle", lambda_=None, n_components=None, eta=None):
     allocation = TRANSPORT_ALLOCATIONS[env]
     return job(
         env,
@@ -290,13 +301,14 @@ def experiment_plan(env):
                 for eta in bound_eta_grid(env) + LARGE_AUXILIARY_ETAS
                 if eta != auxiliary_eta(env)
             )
-        if env == "cybersecurity":
-            jobs.append(job(env, "mfqlearning", horizon))
+        jobs.append(job(env, "ihmfcac", horizon, flow="particle"))
         return jobs
 
     if env in CONTINUOUS_ENVS:
         jobs = [job(env, "reinforce", horizon), finite_difference_job(env)] + continuous_transport_jobs(env)
         # Transport-Proba hands the environment a population mean, which the bimodal reward does not read.
+        if env == "lq":
+            jobs.append(job(env, "ihmfcac", TRANSPORT_ALLOCATIONS[env]["horizon"], flow="particle"))
         return jobs if env == "bimodal" else jobs + gaussian_jobs(env)
 
     raise ValueError(f"Unknown environment: {env}")
@@ -344,6 +356,13 @@ def fair_run_parameters(job_spec):
         parameters["n_train"] = allocation["updates"]
         parameters["lr"] = allocation["lr"]
 
+    if algorithm == "ihmfcac":
+        # Match the total transitions of the Transport run, not its update count.
+        bins = {"traffic": 81, "twostate": 4, "advertising": 4, "cybersecurity": 8, "distribution": 30, "lq": 42}[env]
+        cost = bins + 1
+        cap = allocation["updates"] * horizon * transport_per_step_budget(env)
+        return {"n_train": cap // cost, "max_transitions": cap,
+                "validation_interval": max(1, 10 * horizon * transport_per_step_budget(env) // cost)}
     if algorithm == "mfreinforce":
         selected = MF_REINFORCE_SPLITS.get(env, {})
         parameters["n_particles"] = selected.get("n_particles", ref_particles)
@@ -370,8 +389,6 @@ def fair_run_parameters(job_spec):
             parameters["n_logit_gradient"] = allocation["n"]
         else:
             parameters["n_law_gradient"] = allocation["n"]
-    elif algorithm == "mfqlearning" and allocation is None:
-        parameters["n_train"] = round(base_cost * (reference["n_train"] if "n_train" in reference else 20_000))
 
     if (
         job_spec["flow"] == "particle"
@@ -432,13 +449,14 @@ def command_for(job_spec, seed, args):
         "--n-flow-particles": args.n_flow_particles
         if args.n_flow_particles is not None
         else fair_parameters.get("n_flow_particles"),
-        "--validation-interval": args.validation_interval,
+        "--validation-interval": args.validation_interval if args.validation_interval is not None
+        else fair_parameters.get("validation_interval"),
         "--simplex-sigma": args.simplex_sigma
         if args.simplex_sigma is not None
         else job_spec.get("simplex_sigma"),
-        "--simplex-resolution": args.simplex_resolution,
-        "--q-learning-lr-power": args.q_learning_lr_power,
-        "--q-learning-sampling": args.q_learning_sampling,
+        "--ac-discount": getattr(args, "ac_discount", None),
+        "--max-transitions": getattr(args, "max_transitions", None)
+        if getattr(args, "max_transitions", None) is not None else fair_parameters.get("max_transitions"),
     }
     for flag, value in optional_values.items():
         if value is not None:
@@ -479,8 +497,9 @@ def manifest_rows(envs, seeds, args):
                 "n_particles": parameters.get("n_particles"),
                 "auxiliary": parameters.get("n_logit_gradient", parameters.get("n_law_gradient")),
                 "population": parameters.get("n_flow_particles"),
-                "budget_per_update": None if algorithm == "mfqlearning"
-                else allocation["horizon"] * transport_per_step_budget(env),
+                "budget_per_update": ({"traffic": 82, "twostate": 5, "advertising": 5, "cybersecurity": 9,
+                                       "distribution": 31, "lq": 43}[env] if algorithm == "ihmfcac"
+                                      else allocation["horizon"] * transport_per_step_budget(env)),
                 "seeds": " ".join(str(seed) for seed in seeds),
                 "command": " ".join(["python scripts/train.py"] + [str(part) for part in command[2:]])
                 .replace(f"--seed {seeds[0]}", "--seed SEED"),
@@ -513,9 +532,8 @@ def parse_args():
     parser.add_argument("--n-flow-particles", type=int, default=None)
     parser.add_argument("--validation-interval", type=int, default=None)
     parser.add_argument("--simplex-sigma", type=float, default=None)
-    parser.add_argument("--simplex-resolution", type=int, default=None)
-    parser.add_argument("--q-learning-lr-power", type=float, default=None)
-    parser.add_argument("--q-learning-sampling", choices=["sweep", "iid"], default=None)
+    parser.add_argument("--ac-discount", type=float, default=None)
+    parser.add_argument("--max-transitions", type=int, default=None)
     parser.add_argument("--n-components", type=int, default=None)
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--no-baseline", action="store_true")

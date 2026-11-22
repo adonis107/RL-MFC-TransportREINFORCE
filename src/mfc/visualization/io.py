@@ -29,6 +29,12 @@ def dataclass_from_dict(config_class, values, device=None):
     config = config_class()
     names = {field.name for field in fields(config)}
     cleaned = clean_config_values(values)
+    # Traffic runs predating the initial-law field used only Dirichlet laws.
+    # Keep their recorded protocol when the current benchmark default changes.
+    if config_class is ENVIRONMENTS["traffic"][1]:
+        cleaned.setdefault("training_initial_law", "dirichlet")
+        cleaned.setdefault("congestion_reward", "local")
+        cleaned.setdefault("precision", "float32")
     if device is not None and "device" in names:
         cleaned["device"] = device
     updates = {key: value for key, value in cleaned.items() if key in names}
@@ -50,6 +56,8 @@ def load_runs(results_root="results", env=None):
             continue
 
         metadata = read_json(metadata_path)
+        if metadata.get("algorithm") == "mfqlearning":
+            continue
         history = read_json(history_path)
         summary = read_json(summary_path) if summary_path.exists() else {}
         runs.append(
@@ -69,9 +77,9 @@ def run_label(metadata):
     algorithm = metadata["algorithm"]
     if algorithm == "reinforce":
         return "REINFORCE"
-    if algorithm == "mfqlearning":
-        resolution = metadata.get("algorithm_config", {}).get("simplex_resolution")
-        return "MFQ-learning" if resolution is None else f"MFQ-learning Nm={resolution}"
+    if algorithm == "ihmfcac":
+        discount = metadata["algorithm_config"]["discount"]
+        return f"IH-MFC-AC discount={discount:g}"
     if algorithm == "mfreinforce":
         return f"MF-REINFORCE eps={metadata['perturbation']:g}"
     if algorithm == "gaussian":
@@ -85,6 +93,8 @@ def run_label(metadata):
     components = metadata.get("algorithm_config", {}).get("n_components")
     if components is not None:
         label += f", K={components:g}"
+    if metadata.get("algorithm_config", {}).get("auxiliary_batches") == "fresh":
+        label += ", fresh batches"
     return label
 
 
@@ -99,8 +109,8 @@ def best_runs_by_label(runs, prefer_validation=True):
         if value is None:
             continue
         eta_key = metadata.get("eta")
-        if metadata["algorithm"] == "mfqlearning":
-            eta_key = metadata.get("algorithm_config", {}).get("simplex_resolution")
+        if metadata["algorithm"] == "ihmfcac":
+            eta_key = tuple(sorted((k, v) for k, v in metadata.get("algorithm_config", {}).items() if k != "seed"))
         key = (
             metadata["algorithm"],
             metadata["perturbation"],
@@ -108,6 +118,7 @@ def best_runs_by_label(runs, prefer_validation=True):
             metadata["horizon"],
             metadata["flow"],
             metadata.get("algorithm_config", {}).get("n_components"),
+            metadata.get("algorithm_config", {}).get("auxiliary_batches", "shared"),
         )
         if key not in best or value > best[key][0]:
             best[key] = (value, run)
@@ -119,6 +130,13 @@ def runs_dataframe(runs):
     for run in runs:
         metadata = run["metadata"]
         summary = run["summary"]
+        transitions = metadata.get("simulator_transitions")
+        if transitions is None:
+            iterations = summary.get("training_iterations")
+            if iterations is None:
+                iterations = metadata["algorithm_config"].get("n_train") or metadata["env_config"].get("n_train")
+            cost = metadata.get("simulator_budget_estimate")
+            transitions = cost * iterations if cost is not None and iterations is not None else None
         rows.append(
             {
                 "path": str(run["path"]),
@@ -145,6 +163,7 @@ def runs_dataframe(runs):
                 ),
                 "validation_seconds_per_call": summary.get("validation_seconds_per_call", 0.0),
                 "simulator_budget_estimate": metadata.get("simulator_budget_estimate"),
+                "total_simulator_transitions": transitions,
                 "last_objective": summary.get("last_objective"),
                 "last_validation_objective": summary.get("last_validation_objective"),
             }
@@ -194,10 +213,10 @@ def load_env_and_policy(run, device=None):
     payload = torch.load(run["policy_path"], map_location=env.device, weights_only=False)
     if payload["kind"] == "tensor":
         policy = torch.nn.Parameter(payload["tensor"].to(device=env.device, dtype=env.dtype))
-    elif payload["kind"] == "mean_field_q_policy":
-        from mfc.algorithms import MeanFieldQPolicy
+    elif payload["kind"] == "ih_mfc_ac_actor":
+        from mfc.algorithms import StationaryActor
 
-        policy = MeanFieldQPolicy.from_payload(payload, device=env.device, dtype=env.dtype)
+        policy = StationaryActor.from_payload(payload, device=env.device, dtype=env.dtype)
     elif payload["kind"] == "module_state_dict":
         policy = POLICIES[metadata["env"]](config)
         policy.load_state_dict(payload["state_dict"])

@@ -3,6 +3,7 @@ import torch
 
 from .constants import STATE_LABELS
 from .io import load_env_and_policy
+from mfc.algorithms.validation import particle_actions, particle_law, particle_step
 
 
 def policy_time(policy, env, t):
@@ -16,7 +17,8 @@ def discrete_next_law(env, policy, t, law):
     with torch.no_grad():
         for state_index in range(env.n_states):
             state = torch.tensor(state_index, dtype=torch.long, device=env.device)
-            action_probabilities = env.policy(policy, policy_time(policy, env, t), state, law)
+            action_probabilities = (policy.distribution(state).probs if getattr(policy, "is_stationary_actor", False)
+                                    else env.policy(policy, policy_time(policy, env, t), state, law))
             for action_index in range(env.n_actions):
                 action = torch.tensor(action_index, dtype=torch.long, device=env.device)
                 transition = env.transition(state, law, action)
@@ -32,6 +34,18 @@ def discrete_law_flow(env, policy, horizon):
 
 
 def continuous_moment_flow(env, policy, horizon):
+    if getattr(policy, "is_stationary_actor", False):
+        generator = torch.Generator(device=env.device).manual_seed(0)
+        states = env.sample_initial(env.config.validation_particles, generator)
+        moments = []
+        with torch.no_grad():
+            for t in range(horizon + 1):
+                moments.append(torch.stack([states.mean(), states.var(unbiased=False)]))
+                if t < horizon:
+                    law = particle_law(env, states)
+                    actions = particle_actions(env, policy, lambda s: s, t, states, law, generator)
+                    states = particle_step(env, t, states, law, actions, generator)
+        return torch.stack(moments)
     if hasattr(env, "moment_flow"):
         with torch.no_grad():
             means, variances = env.moment_flow(policy, lambda_=0.0)
@@ -68,7 +82,9 @@ def final_policy_probabilities(env, policy, law=None, t=0):
     with torch.no_grad():
         for state_index in range(env.n_states):
             state = torch.tensor(state_index, dtype=torch.long, device=env.device)
-            probabilities.append(env.policy(policy, policy_time(policy, env, t), state, law).detach().cpu())
+            values = (policy.distribution(state).probs if getattr(policy, "is_stationary_actor", False)
+                      else env.policy(policy, policy_time(policy, env, t), state, law))
+            probabilities.append(values.detach().cpu())
     return torch.stack(probabilities)
 
 

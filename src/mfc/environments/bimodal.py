@@ -88,6 +88,11 @@ class Bimodal:
     def empirical_law(self, states):
         return self.kernel(states).mean(dim=-1).detach()
 
+    def initial_population_law(self):
+        mean = torch.ones((), dtype=self.dtype, device=self.device)
+        variance = torch.full_like(mean, self.config.initial_variance)
+        return self.kernel_mass(mean, variance)
+
     def state_law_features(self, states):
         return self.kernel(states).unsqueeze(-1)
 

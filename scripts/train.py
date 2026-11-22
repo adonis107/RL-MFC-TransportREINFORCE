@@ -19,8 +19,8 @@ from mfc.algorithms import (
     DiscreteTransportConfig,
     FiniteDifference,
     FiniteDifferenceConfig,
-    MeanFieldQLearning,
-    MeanFieldQLearningConfig,
+    IHMFCAC,
+    IHMFCACConfig,
     MFReinforce,
     MFReinforceConfig,
     Reinforce,
@@ -41,11 +41,15 @@ from mfc.environments import (
     PortfolioConfig,
     TwoState,
     TwoStateConfig,
+    Traffic,
+    TrafficConfig,
+    TrafficPolicy,
 )
 
 
 ENVIRONMENTS = {
     "twostate": (TwoState, TwoStateConfig),
+    "traffic": (Traffic, TrafficConfig),
     "cybersecurity": (Cybersecurity, CybersecurityConfig),
     "distribution": (Distribution, DistributionConfig),
     "advertising": (Advertising, AdvertisingConfig),
@@ -54,7 +58,7 @@ ENVIRONMENTS = {
     "bimodal": (Bimodal, BimodalConfig),
 }
 
-DISCRETE_ENVS = {"twostate", "cybersecurity", "distribution", "advertising"}
+DISCRETE_ENVS = {"traffic", "twostate", "cybersecurity", "distribution", "advertising"}
 CONTINUOUS_ENVS = {"lq", "portfolio", "bimodal"}
 TRANSPORT_ALGORITHMS = {"transport"}
 # Transport on the Gaussian manifold with a likelihood-ratio flow sensitivity: no
@@ -143,8 +147,8 @@ def perturbation_label(algorithm, perturbation, eta, common_random_numbers=False
         return f"lambda_{perturbation:g}"
     if algorithm == "reinforce":
         return "none"
-    if algorithm == "mfqlearning":
-        return "simplex"
+    if algorithm == "ihmfcac":
+        return "continuing"
     if algorithm == "mfreinforce":
         return f"eps_{perturbation:g}"
     if eta is None:
@@ -155,11 +159,34 @@ def perturbation_label(algorithm, perturbation, eta, common_random_numbers=False
 def output_directory(args, algorithm=None):
     eta = metadata_eta(args, algorithm) if algorithm is not None else args.eta
     label = perturbation_label(args.algorithm, args.perturbation, eta, getattr(args, "common_random_numbers", False))
-    if args.algorithm == "mfqlearning":
-        label = f"Nm_{args.simplex_resolution}"
+    if args.algorithm == "ihmfcac":
+        c = algorithm.config if algorithm is not None else None
+        gamma = c.discount if c else getattr(args, "ac_discount", IHMFCACConfig.discount)
+        label = f"discount_{gamma:g}"
+        if args.env in CONTINUOUS_ENVS:
+            m = c.state_bins if c else getattr(args, "state_bins", 6)
+            a = c.action_bins if c else getattr(args, "action_bins", 7)
+            label += f"_bins_{m}x{a}"
+    if args.algorithm == "transport" and args.env in DISCRETE_ENVS and getattr(args, "auxiliary_batches", "shared") == "fresh":
+        label = f"{label}_fresh"
     components = getattr(args, "n_components", None)
     if components is not None and args.env in CONTINUOUS_ENVS and args.algorithm == "transport":
         label = f"{label}_K_{components}"
+    if args.env == "traffic":
+        config = algorithm.env.config if algorithm is not None else TrafficConfig()
+        reward = getattr(args, "traffic_reward", None) or config.congestion_reward
+        precision = getattr(args, "traffic_precision", None) or config.precision
+        if reward != "local":
+            label += f"_reward_{reward}"
+        if precision != "float32":
+            label += "_fp64"
+        family = getattr(args, "traffic_initial_laws", None) or config.training_initial_law
+        probability = getattr(args, "traffic_jam_probability", None)
+        probability = config.training_jam_probability if probability is None else probability
+        if family != "dirichlet":
+            label += f"_init_{family}"
+            if family == "mixed":
+                label += f"_p_{probability:g}"
     name = f"{args.algorithm}_{label}_T_{args.horizon}_{args.flow}_seed_{args.seed}"
     return Path(args.results_root) / args.env / name
 
@@ -178,8 +205,14 @@ def build_environment(args):
         "validation_particles": args.validation_particles,
     }
 
-    if args.env in {"advertising", "distribution"}:
+    if args.env in {"advertising", "distribution", "traffic"}:
         updates["T_val"] = args.horizon
+    if args.env == "traffic":
+        updates["cells"] = getattr(args, "traffic_cells", None)
+        updates["congestion_reward"] = getattr(args, "traffic_reward", None)
+        updates["precision"] = getattr(args, "traffic_precision", None)
+        updates["training_initial_law"] = getattr(args, "traffic_initial_laws", None)
+        updates["training_jam_probability"] = getattr(args, "traffic_jam_probability", None)
 
     config = update_dataclass(config, **updates)
     return env_class(config)
@@ -202,16 +235,23 @@ def build_algorithm(args, env):
     if args.algorithm == "reinforce":
         return Reinforce(env, config=ReinforceConfig(**common, baseline=use_baseline))
 
-    if args.algorithm == "mfqlearning":
-        if args.env != "cybersecurity":
-            raise ValueError("Mean-field Q-learning is currently configured only for cybersecurity.")
-        config = MeanFieldQLearningConfig(
-            **common,
-            learning_rate_power=args.q_learning_lr_power,
-            simplex_resolution=args.simplex_resolution,
-            sampling=args.q_learning_sampling,
-        )
-        return MeanFieldQLearning(env, config=config)
+    if args.algorithm == "ihmfcac":
+        if args.flow != "particle":
+            raise ValueError("IH-MFC-AC estimates empirical measures; use --flow particle.")
+        defaults = IHMFCACConfig()
+        return IHMFCAC(env, config=IHMFCACConfig(
+            n_train=args.n_train if args.n_train is not None else defaults.n_train,
+            horizon=args.horizon,
+            validation_interval=args.validation_interval if args.validation_interval is not None else defaults.validation_interval,
+            actor_lr=args.lr if args.lr is not None else defaults.actor_lr,
+            **{name: getattr(args, flag, getattr(defaults, name)) for name, flag in (
+                ("discount", "ac_discount"), ("critic_lr", "critic_lr"), ("population_lr", "population_lr"),
+                ("actor_power", "actor_power"), ("critic_power", "critic_power"), ("population_power", "population_power"),
+                ("state_bins", "state_bins"), ("action_bins", "action_bins"),
+                ("state_min", "state_min"), ("state_max", "state_max"),
+                ("action_min", "action_min"), ("action_max", "action_max"),
+                ("max_transitions", "max_transitions"))},
+            seed=args.seed))
 
     if args.algorithm == "mfreinforce":
         if args.env not in DISCRETE_ENVS:
@@ -275,6 +315,7 @@ def build_algorithm(args, env):
                 n_flow_particles=args.n_flow_particles,
                 n_logit_gradient=args.n_logit_gradient,
                 simplex_sigma=args.simplex_sigma,
+                auxiliary_batches=getattr(args, "auxiliary_batches", "shared"),
                 baseline=use_baseline,
                 reuse_state_gradient=not args.no_reuse_state_gradient,
             )
@@ -319,6 +360,8 @@ def json_ready(value):
 
 
 def simulator_budget_estimate(algorithm):
+    if isinstance(algorithm, IHMFCAC):
+        return algorithm.transitions_per_iteration
     horizon = algorithm.horizon
     particles = algorithm.n_particles
     flow_extra = 0
@@ -333,13 +376,11 @@ def simulator_budget_estimate(algorithm):
     if isinstance(algorithm, Reinforce):
         return particles * horizon
 
-    if isinstance(algorithm, MeanFieldQLearning):
-        return 1
-
     if isinstance(algorithm, DiscreteTransport):
         gradient_samples = algorithm.n_logit_gradient
         gradient_reuses = 1 if algorithm.config.reuse_state_gradient else particles
-        return horizon * particles + horizon * gradient_samples * gradient_reuses + flow_extra
+        auxiliary_steps = horizon if algorithm.config.auxiliary_batches == "shared" else horizon * (horizon + 1) // 2
+        return horizon * particles + auxiliary_steps * gradient_samples * gradient_reuses + flow_extra
 
     if isinstance(algorithm, GaussianTransport):
         # One auxiliary batch, no shifted sub-blocks: n trajectories of length T.
@@ -372,7 +413,7 @@ def code_version():
 
 
 def metadata_eta(args, algorithm):
-    if args.algorithm in {"reinforce", "gaussian", "finitediff"}:
+    if args.algorithm in {"reinforce", "gaussian", "finitediff", "ihmfcac"}:
         return None
     if args.algorithm == "mfreinforce":
         return algorithm.perturbation_eta
@@ -382,6 +423,8 @@ def metadata_eta(args, algorithm):
 
 
 def validation_steps(algorithm, history):
+    if "validation_steps" in history:
+        return history["validation_steps"]
     if not algorithm.validation_interval:
         return []
     return [
@@ -437,6 +480,14 @@ def run_training(args):
         "validation_seconds": validation_seconds,
         "unaccounted_seconds": unaccounted_seconds,
     }
+    if isinstance(algorithm, IHMFCAC):
+        metadata.update(training_objective="discounted_continuing_running_reward",
+                        training_discount=algorithm.config.discount,
+                        evaluation_objective="benchmark_finite_horizon_with_terminal_reward",
+                        training_objective_log="individual_path_one_step_reward",
+                        simulator_transitions=algorithm.simulator_transitions,
+                        training_iterations=algorithm.iterations)
+        torch.save(algorithm.checkpoint(), out_dir / "algorithm.pt")
     history["validation_steps"] = validation_steps(algorithm, history)
 
     with (out_dir / "metadata.json").open("w", encoding="utf-8") as file:
@@ -447,6 +498,8 @@ def run_training(args):
 
     summary = {
         "output_dir": str(out_dir),
+        "training_iterations": getattr(algorithm, "iterations", algorithm.n_train),
+        "simulator_transitions": getattr(algorithm, "simulator_transitions", None),
         "last_objective": history["objective"][-1] if history["objective"] else None,
         "last_validation_objective": history["validation_objective"][-1]
         if history["validation_objective"]
@@ -468,13 +521,8 @@ def run_training(args):
 
 
 def default_flow(args):
-    """Population flow used when --flow is not given.
-
-    The continuous mixture coordinate is fitted to a population particle block,
-    so 'exact' is only available there as a single-Gaussian oracle and cannot be
-    the default. Everywhere else the exact law recursion remains the default.
-    """
-    if args.env in CONTINUOUS_ENVS and args.algorithm in TRANSPORT_ALGORITHMS | GAUSSIAN_ALGORITHMS:
+    """Use particle population estimates for the model-free training algorithms."""
+    if args.algorithm in TRANSPORT_ALGORITHMS | GAUSSIAN_ALGORITHMS | {"mfreinforce", "ihmfcac"}:
         return "particle"
     return "exact"
 
@@ -485,7 +533,7 @@ def parse_args():
     parser.add_argument(
         "--algorithm",
         "--alg",
-        choices=["reinforce", "mfreinforce", "transport", "gaussian", "finitediff", "mfqlearning"],
+        choices=["reinforce", "mfreinforce", "transport", "gaussian", "finitediff", "ihmfcac"],
         required=True,
     )
     parser.add_argument("--perturbation", type=maybe_float, default=None)
@@ -495,6 +543,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--results-root", default="results")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--traffic-cells", type=int, default=None, help="Traffic position cells per lane")
+    parser.add_argument("--traffic-reward", choices=["local", "shared"], default=None)
+    parser.add_argument("--traffic-precision", choices=["float32", "float64"], default=None)
+    parser.add_argument("--traffic-initial-laws", choices=["dirichlet", "jam", "mixed"], default=None)
+    parser.add_argument("--traffic-jam-probability", type=float, default=None)
     parser.add_argument("--n-train", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--n-particles", type=int, default=None)
@@ -504,10 +557,24 @@ def parse_args():
     parser.add_argument("--n-flow-particles", type=int, default=None)
     parser.add_argument("--validation-interval", type=int, default=None)
     parser.add_argument("--validation-particles", type=int, default=None)
+    parser.add_argument("--auxiliary-batches", choices=["shared", "fresh"], default="shared",
+                        help="discrete Transport: shared experiment batch or independent theorem batches")
     parser.add_argument("--simplex-sigma", type=float, default=1.0)
-    parser.add_argument("--simplex-resolution", type=int, default=30)
-    parser.add_argument("--q-learning-lr-power", type=float, default=0.6)
-    parser.add_argument("--q-learning-sampling", choices=["sweep", "iid"], default="sweep")
+    parser.add_argument("--ac-discount", type=float, default=IHMFCACConfig.discount,
+                        help="IH-MFC-AC continuing training discount; evaluation retains benchmark discount")
+    parser.add_argument("--critic-lr", type=float, default=1e-4)
+    parser.add_argument("--population-lr", type=float, default=1e-3)
+    parser.add_argument("--actor-power", type=float, default=0.9)
+    parser.add_argument("--critic-power", type=float, default=0.75)
+    parser.add_argument("--population-power", type=float, default=0.6)
+    parser.add_argument("--state-bins", type=int, default=6)
+    parser.add_argument("--action-bins", type=int, default=7)
+    parser.add_argument("--state-min", type=float, default=-3.0)
+    parser.add_argument("--state-max", type=float, default=3.0)
+    parser.add_argument("--action-min", type=float, default=-3.0)
+    parser.add_argument("--action-max", type=float, default=3.0)
+    parser.add_argument("--max-transitions", type=int, default=None,
+                        help="IH-MFC-AC hard training transition cap; incomplete iterations are unused")
     parser.add_argument("--n-components", type=int, default=None)
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--no-baseline", action="store_true")

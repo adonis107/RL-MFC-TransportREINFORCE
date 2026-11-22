@@ -47,9 +47,8 @@ def parse_args():
     parser.add_argument("--n-flow-particles", type=int, default=None)
     parser.add_argument("--validation-interval", type=int, default=None)
     parser.add_argument("--simplex-sigma", type=float, default=None)
-    parser.add_argument("--simplex-resolution", type=int, default=None)
-    parser.add_argument("--q-learning-lr-power", type=float, default=None)
-    parser.add_argument("--q-learning-sampling", choices=["sweep", "iid"], default=None)
+    parser.add_argument("--ac-discount", type=float, default=None)
+    parser.add_argument("--max-transitions", type=int, default=None)
     parser.add_argument("--n-components", type=int, default=None)
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--no-baseline", action="store_true")
@@ -100,7 +99,8 @@ def train_args_for(job_spec, seed, args):
         flow=job_spec["flow"],
         seed=seed,
         results_root=args.results_root,
-        simplex_resolution=args.simplex_resolution or 30,
+        ac_discount=getattr(args, "ac_discount", None) if getattr(args, "ac_discount", None) is not None
+        else train_script.IHMFCACConfig.discount,
         # output_directory separates the mixture sizes, so resume and dedup have
         # to see the same value the launcher puts on the command line.
         n_components=job_spec.get("n_components") or args.n_components,

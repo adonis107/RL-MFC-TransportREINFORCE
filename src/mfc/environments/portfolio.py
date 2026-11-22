@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import torch
 
-from .randomizers import resolve
+from .randomizers import LawRandomizer, resolve
 
 
 @dataclass(frozen=True)
@@ -112,8 +112,8 @@ class Portfolio:
 
         for t in range(self.config.T):
             k, ell = theta[t]
-            law_variance = randomizer.variance(lambda_)
-            law_mean = kappa * represented[t]
+            law_variance = 0.0 if t == 0 else randomizer.variance(lambda_)
+            law_mean = represented[t] if t == 0 else kappa * represented[t]
 
             # W = X - M with X and M independent, so Var(W) = Var(X) + Var(M)
             # and E[W^2] carries the squared offset E[X] - E[M] as well. That
@@ -157,19 +157,29 @@ class Portfolio:
         kappa = resolved.mean_coefficient(lambda_)
         represented, mu, Sigma = self.flows(theta, lambda_, randomizer)
 
-        terminal_offset = mu[-1] - kappa * represented[-1]
+        terminal_offset = mu[-1] - (represented[-1] if self.config.T == 0 else kappa * represented[-1])
         value = mu[-1] - self.config.chi * (
-            Sigma[-1] + resolved.variance(lambda_) + terminal_offset.square()
+            Sigma[-1] + (0.0 if self.config.T == 0 else resolved.variance(lambda_)) + terminal_offset.square()
         )
 
         gamma = self.config.mean_field_penalty
         if gamma != 0.0:
-            law_mean = kappa * torch.stack(represented[: self.config.T])
-            running = law_mean.square() + resolved.variance(lambda_)
+            law_mean = torch.stack([m if t == 0 else kappa * m for t, m in enumerate(represented[: self.config.T])])
+            noise_variance = torch.full_like(law_mean, resolved.variance(lambda_))
+            noise_variance[0] = 0.0
+            running = law_mean.square() + noise_variance
             value = value - gamma * running.sum()
         return value
 
-    def exact_gradient(self, theta, lambda_=None):
+    def exact_gradient(self, theta, lambda_=None, randomizer=None):
+        """Reference derivative of objective(), with the same randomizer convention."""
+        with torch.enable_grad():
+            parameter = theta if theta.requires_grad else theta.detach().requires_grad_(True)
+            value = self.objective(parameter, lambda_=lambda_, randomizer=randomizer)
+            gradient = torch.autograd.grad(value, parameter, create_graph=theta.requires_grad)[0]
+        return gradient
+
+    def exact_additive_gradient(self, theta, lambda_=None):
         """Analytic gradient of the objective under the additive convention.
 
         This adjoint recursion is written for the reference's additive
@@ -178,7 +188,7 @@ class Portfolio:
         directly, which is what the estimators and scripts/decomposition.py do.
         """
         lambda_ = self.config.perturbation_scale if lambda_ is None else lambda_
-        mu, Sigma = self.moment_flow(theta, lambda_)
+        mu, Sigma = self.moment_flow(theta, lambda_, randomizer=LawRandomizer(kind="additive", sigma=self.config.rho))
         p = torch.empty(self.config.T + 1, dtype=self.dtype, device=self.device)
         adj_var = torch.empty(self.config.T + 1, dtype=self.dtype, device=self.device)
 
@@ -197,7 +207,7 @@ class Portfolio:
             k, ell = theta[t]
             grad[t, 0] = 2.0 * adj_var[t + 1] * (
                 (self.s[t] * self.rbar[t] + self.h[t] * k) * Sigma[t]
-                + self.h[t] * k * lambda_**2 * self.config.rho**2
+                + self.h[t] * k * (0.0 if t == 0 else lambda_**2 * self.config.rho**2)
             )
             grad[t, 1] = self.rbar[t] * p[t + 1] + 2.0 * self.sigma_R[t].square() * ell * adj_var[t + 1]
 

@@ -111,33 +111,7 @@ def oracles(algorithm, initial_distribution):
 
 def fresh_sensitivities(algorithm, laws, seed, initial_distribution, eta):
     """The analysed estimator: batch t is new randomness, of length t, using the earlier estimates."""
-    env, n = algorithm.env, algorithm.n_logit_gradient
-    generator = torch.Generator(device=env.device)
-    generator.manual_seed(seed)
-    sensitivities = [torch.zeros(env.n_states, algorithm.n_parameters, dtype=env.dtype)]
-    factor = (1.0 - eta) / eta
-    for target_t in range(1, algorithm.horizon + 1):
-        states = algorithm.initial_states(n, generator, initial_distribution)
-        policy_score = torch.zeros(n, algorithm.n_parameters, dtype=env.dtype)
-        law_score = torch.zeros(n, algorithm.n_parameters, dtype=env.dtype)
-        for s in range(target_t):
-            q = algorithm.sample_simplex_batch(n, generator)
-            perturbed = algorithm.perturb_law(laws[s], q, eta)
-            with torch.no_grad():
-                actions, _ = algorithm.sample_actions_with_log_probs(s, states, perturbed, generator)
-            policy_score = policy_score + algorithm.per_sample_log_prob_gradients(s, states, perturbed, actions)
-            law_score = law_score - factor * (algorithm.simplex_score_h(q) @ sensitivities[s][:-1])
-            with torch.no_grad():
-                states = algorithm.sample_next_state(s, states, perturbed, actions, generator)
-        numerator = torch.zeros(env.n_states - 1, algorithm.n_parameters, dtype=env.dtype)
-        mask = states < env.n_states - 1
-        numerator.index_add_(0, states[mask], law_score[mask])
-        numerator = numerator + algorithm.state_indicators(states)[:-1] @ policy_score
-        current = torch.zeros(env.n_states, algorithm.n_parameters, dtype=env.dtype)
-        current[:-1] = numerator / n
-        current[-1] = -current[:-1].sum(dim=0)
-        sensitivities.append(current)
-    return sensitivities
+    return algorithm.fresh_state_sensitivities(laws, seed, initial_distribution, eta)
 
 
 def relative_error(estimates, oracle):

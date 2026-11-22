@@ -130,7 +130,7 @@ def discrete_value(env, policy, horizon, discount, initial_law, scale, randomize
     value = torch.zeros((), dtype=env.dtype, device=env.device)
     factor = 1.0
     for t in range(horizon):
-        nu = randomizer(mu, t, scale)
+        nu = mu.expand(n_draws, -1) if t == 0 else randomizer(mu, t, scale)
         probabilities = action_probabilities(env, policy, t, nu)
         rewards = reward_matrix(env, nu)
         kernels = kernel_matrix(env, nu)

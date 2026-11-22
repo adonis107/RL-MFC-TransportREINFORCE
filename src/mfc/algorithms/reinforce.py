@@ -74,6 +74,7 @@ class Reinforce:
         return policy_class(self.env.config)
 
     def sample_initial_distribution(self, generator):
+        # Sample once per training update, then share this law across its stages.
         if hasattr(self.env, "sample_initial_distribution"):
             return self.env.sample_initial_distribution(generator)
         return self.env.initial_distribution

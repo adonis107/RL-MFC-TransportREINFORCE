@@ -99,8 +99,7 @@ def screen(env_name, device, seeds, replications):
     rows = []
     for seed in seeds:
         env, algorithm, steps, exact = pick_reference(env_name, horizon, device, seed)
-        # Only the estimator's own randomness should vary between cells, so the initial
-        # law is held fixed rather than resampled inside every gradient call.
+        # Compare every estimator against the oracle for the same initial law.
         law = env.initial_distribution.clone()
         for eta in ETAS:
             for sigma in SIGMAS:

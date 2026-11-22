@@ -30,6 +30,7 @@ from mfc.algorithms import (
 )
 from mfc.environments import LQ, LQConfig, Portfolio, PortfolioConfig
 from mfc.environments.randomizers import LawRandomizer
+from mfc.algorithms.validation import initial_population_law
 
 # sign turns each benchmark's objective() into the reward the estimators maximize.
 BENCHMARKS = {
@@ -65,12 +66,12 @@ def mixture_laws(env, policy, lambda_, n, generator):
     )
     coordinates, _ = algorithm.population_coordinates(jacobians=False)
     return [
-        algorithm.population_law(
+        initial_population_law(env).expand(n) if t == 0 else algorithm.population_law(
             algorithm.transport_coordinate(
                 coordinate, algorithm.sample_transport_randomizers((n,), generator), lambda_
             )
         )
-        for coordinate in coordinates
+        for t, coordinate in enumerate(coordinates)
     ], LawRandomizer(kind="mixture", sigma=algorithm.config.mean_randomizer_sigma)
 
 
@@ -88,19 +89,19 @@ def gaussian_laws(env, policy, lambda_, n, generator):
     laws = []
     for t in range(algorithm.horizon + 1):
         a, _ = algorithm.sample_randomizers(n, generator)
-        laws.append(algorithm.perturbed_law(a, means[t]))
+        laws.append(initial_population_law(env).expand(n) if t == 0 else algorithm.perturbed_law(a, means[t]))
     return laws, algorithm.randomizer
 
 
 def additive_laws(env, policy, lambda_, n, generator):
-    """The reference's additive convention: the mean plus lambda rho noise."""
+    """Optional additive diagnostic: the mean plus lambda rho noise."""
     algorithm = GaussianTransport(
         env, policy=policy, config=GaussianTransportConfig(lambda_=lambda_, flow="exact")
     )
     means, _ = algorithm.population_moments(0)
     rho = env.config.rho
     laws = [
-        means[t]
+        initial_population_law(env).expand(n) if t == 0 else means[t]
         + lambda_ * rho * torch.randn(n, dtype=env.dtype, device=env.device, generator=generator)
         for t in range(algorithm.horizon + 1)
     ]

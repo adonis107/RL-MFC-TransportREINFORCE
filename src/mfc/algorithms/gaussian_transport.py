@@ -1,6 +1,6 @@
 """Transport REINFORCE on the Gaussian manifold.
 
-Under a Gaussian policy and linear dynamics the controlled law stays Gaussian,
+With Gaussian initial states and linear-Gaussian dynamics the controlled law stays Gaussian,
 so the population coordinate is the pair (m_t, sigma_t), perturbed as
 
     m_t^lambda     = (1 - lambda) m_t + lambda A_t,
@@ -16,22 +16,27 @@ closed-form density whose score is
 
     grad log q_t = c_t^m grad m_t + c_t^sigma grad log sigma_t,
     c_t^m     = ((1 - lambda) / lambda) (A_t - mu_A) / sigma_A^2,
-    c_t^sigma = (U_t / lambda) (B_t - mu_B) / sigma_B^2 - 1.
+    c_t^sigma = U_t / (lambda B_t) (1 + log(B_t) / sigma_G^2) - 1,
 
-Both coefficients are known from the draw, so the only unknowns are the flow
-sensitivities. Transport REINFORCE estimates the analogous object by centered
+for the default B_t = exp(sigma_G G_t), G_t ~ N(0,1).
+
+For the optional truncated-normal scale law, c_t^sigma instead uses its
+normal density score. Both coefficients are known from the draw; the flow
+sensitivities must be estimated. Transport REINFORCE estimates the analogous object by centered
 policy differences, costing 2 d_theta shifted sub-blocks. Here they come from a
 likelihood ratio instead: the mean and second moment of the state at time t are
 themselves objectives of the same control problem, so with
 S_t = sum_{tau < t} (grad log pi_tau + grad log q_tau),
 
-    grad m_t        = E[ X_t^lambda S_t ],
-    grad E[(X_t)^2] = E[ (X_t^lambda)^2 S_t ],
+    grad m_t        approx E[ X_t^lambda S_t ],
+    grad E[(X_t)^2] approx E[ (X_t^lambda)^2 S_t ],
     grad Var(X_t)   = grad E[(X_t)^2] - 2 m_t grad m_t,
 
 and grad log sigma_t = grad Var(X_t) / (2 sigma_t^2). The scores in S_t involve
-only times before t, so one forward pass resolves the recursion. The tau = 0
-term vanishes, (m_0, sigma_0) being known and independent of theta.
+only times before t, so one forward pass resolves the recursion. The population
+score at tau = 0 vanishes; the policy score at tau = 0 remains. These moment
+sensitivity identities are approximations at nonzero lambda, as in the paper.
+For the non-Gaussian benchmark laws the coordinate is a moment-matched fit.
 
 No policy is ever shifted, so the estimator has one perturbation scale and no
 auxiliary radius.
@@ -44,8 +49,8 @@ import torch
 from torch import nn
 
 from ..environments.randomizers import LawRandomizer
-from .validation import monte_carlo_objective
-from .sampling import sample_accepts_time
+from .validation import initial_population_law, monte_carlo_objective
+from .sampling import independent_return_advantages, sample_accepts_time
 from .timing import report_progress, synchronized_time
 
 
@@ -58,10 +63,9 @@ class GaussianTransportConfig:
 
     A_t is the random target of the mean, drawn over all of R; its defaults are
     those of the mixture chart, which is what puts the two continuous arms on
-    one perturbed objective. B_t is the relative target of the standard
-    deviation, truncated to B_t > -(1 - lambda)/lambda so that U_t stays
-    positive and the randomized variance keeps a support independent of theta.
-    The truncation constant depends on lambda alone and cancels in the score.
+    one perturbed objective. B_t is the relative scale exp(G_t), G_t ~ N(0,1),
+    as specified in the experiment appendix. An explicit truncated_normal option retains the
+    alternative density supported on B_t > -(1-lambda)/lambda.
     """
 
     n_train: int | None = None
@@ -74,6 +78,8 @@ class GaussianTransportConfig:
     lambda_: float | None = None
     mean_randomizer_mean: float = 0.0
     mean_randomizer_sigma: float = 1.0
+    scale_randomizer: str = "lognormal"
+    log_scale_randomizer_sigma: float = 1.0
     scale_randomizer_mean: float = 1.0
     scale_randomizer_sigma: float = 0.5
     sigma_min: float = 1e-3
@@ -95,6 +101,8 @@ class GaussianTransport:
         if config.flow == "exact" and not hasattr(env, "moment_flow"):
             raise ValueError("flow='exact' requires an environment exposing moment_flow.")
 
+        if config.scale_randomizer not in {"lognormal", "truncated_normal"}:
+            raise ValueError("Unknown scale randomizer.")
         self.env = env
         self.config = config
         self.policy = self._make_policy() if policy is None else policy
@@ -245,9 +253,11 @@ class GaussianTransport:
 
     def discounted_returns(self, rewards, terminal_reward):
         values = [None] * (len(rewards) + 1)
-        values[-1] = terminal_reward
+        # Absolute-time discounting is required when each tail multiplies its
+        # time-t score; a relative tail would omit the outer discount**t.
+        values[-1] = self.discount**len(rewards) * terminal_reward
         for t in range(len(rewards) - 1, -1, -1):
-            values[t] = rewards[t] + self.discount * values[t + 1]
+            values[t] = self.discount**t * rewards[t] + values[t + 1]
         return values
 
 
@@ -279,9 +289,10 @@ class GaussianTransport:
             deviations.append(variance.clamp_min(self.config.sigma_min**2).sqrt())
             if t == self.horizon:
                 break
-            actions = self.sample_actions(t, states, mean, generator)
+            law = mean
+            actions = self.sample_actions(t, states, law, generator)
             with torch.no_grad():
-                states = self.sample_next_states(t, states, mean, actions, generator)
+                states = self.sample_next_states(t, states, law, actions, generator)
 
         return torch.stack(means), torch.stack(deviations)
 
@@ -289,8 +300,9 @@ class GaussianTransport:
     def sample_randomizers(self, n, generator, lambda_=None):
         """Draw the pair (A_t, B_t) of one time step, for every particle.
 
-        A_t is the mean target and ranges over all of R. B_t is the relative
-        scale target and is truncated to B_t > -(1 - lambda)/lambda, which is
+        A_t is Gaussian and B_t is lognormal by default, matching the mixture
+        randomizer. For the optional truncated_normal law B_t is truncated to
+        B_t > -(1 - lambda)/lambda, which is
         the support U_lambda: it keeps U_t = (1 - lambda) + lambda B_t positive,
         so the randomized variance never leaves R_+^*. The truncated normal is
         sampled by inverting its conditional distribution function, which is
@@ -303,6 +315,12 @@ class GaussianTransport:
         a = config.mean_randomizer_mean + config.mean_randomizer_sigma * torch.randn(
             n, dtype=dtype, device=device, generator=generator
         )
+
+        if config.scale_randomizer == "lognormal":
+            b = torch.exp(config.log_scale_randomizer_sigma * torch.randn(
+                n, dtype=dtype, device=device, generator=generator
+            ))
+            return a, b
 
         standard = torch.distributions.Normal(
             torch.zeros((), dtype=dtype, device=device),
@@ -327,8 +345,8 @@ class GaussianTransport:
 
         The inverse maps of the density lemma return the draws themselves --
         a_t^{lambda,theta}(m, Sigma) = A_t and b_t^{lambda,theta}(m, Sigma) =
-        B_t -- so the two score coefficients are read straight off the Gaussian
-        scores of A_t and B_t. Both have mean zero, as the score must.
+        B_t -- so the two coefficients use the Gaussian score of A_t and the
+        configured lognormal or truncated-normal score of B_t. Both have mean zero, as the score must.
         """
         lambda_ = self.lambda_ if lambda_ is None else lambda_
         config = self.config
@@ -339,9 +357,12 @@ class GaussianTransport:
             * (a - config.mean_randomizer_mean)
             / config.mean_randomizer_sigma**2
         )
-        c_sigma = (
-            u / lambda_ * (b - config.scale_randomizer_mean) / config.scale_randomizer_sigma**2 - 1.0
-        )
+        if config.scale_randomizer == "lognormal":
+            c_sigma = u / (lambda_ * b) * (1.0 + b.log() / config.log_scale_randomizer_sigma**2) - 1.0
+        else:
+            c_sigma = (
+                u / lambda_ * (b - config.scale_randomizer_mean) / config.scale_randomizer_sigma**2 - 1.0
+            )
         return c_sigma, c_mean
 
     def perturbed_law(self, a, mean, lambda_=None):
@@ -370,7 +391,7 @@ class GaussianTransport:
         trajectory = []
         for t in range(horizon + 1):
             a, b = self.sample_randomizers(n, generator)
-            law = self.perturbed_law(a, means[t])
+            law = initial_population_law(self.env) if t == 0 else self.perturbed_law(a, means[t])
             if t == horizon:
                 trajectory.append((states, law, a, b, None))
                 break
@@ -398,7 +419,8 @@ class GaussianTransport:
                 break
             c_sigma, c_mean = self.score_coefficients(a, b)
             running = running + self.policy_scores(t, states, law, actions)
-            running.addr_(c_sigma, log_deviation_gradients[t]).addr_(c_mean, mean_gradients[t])
+            if t > 0:
+                running.addr_(c_sigma, log_deviation_gradients[t]).addr_(c_mean, mean_gradients[t])
 
         return mean_gradients, log_deviation_gradients
 
@@ -414,36 +436,31 @@ class GaussianTransport:
         n = self.n_particles
         horizon = self.horizon
 
-        base_states = self.env.sample_initial(n, generator)
         states = self.env.sample_initial(n, generator)
-        base_rewards, rewards = [], []
+        rewards = []
         action_log_probs, coefficients = [], []
 
         terminal_law = None
         for t in range(horizon + 1):
             a, b = self.sample_randomizers(n, generator)
-            law = self.perturbed_law(a, means[t])
-            coefficients.append(self.score_coefficients(a, b))
+            law = initial_population_law(self.env) if t == 0 else self.perturbed_law(a, means[t])
+            coefficients.append((torch.zeros_like(a), torch.zeros_like(a)) if t == 0 else self.score_coefficients(a, b))
             if t == horizon:
                 terminal_law = law
                 break
-            base_action = self.sample_actions(t, base_states, means[t], generator)
+            base_law = means[t]
             action = self.sample_actions(t, states, law, generator)
             action_log_probs.append(
                 self.env.policy(self.policy, self.policy_time(t), states, law).log_prob(action)
             )
-            base_rewards.append(self.env.reward(base_states, means[t], base_action))
             rewards.append(self.env.reward(states, law, action))
             with torch.no_grad():
-                base_states = self.sample_next_states(t, base_states, means[t], base_action, generator)
                 states = self.sample_next_states(t, states, law, action, generator)
 
         terminal_reward = self.env.terminal_reward(states, terminal_law)
-        base_terminal_reward = self.env.terminal_reward(base_states, means[-1])
 
         returns = torch.stack(self.discounted_returns(rewards, terminal_reward))
-        base_return = self.discounted_returns(base_rewards, base_terminal_reward)[0]
-        advantages = returns - returns.mean(dim=1, keepdim=True) if self.config.baseline else returns
+        advantages = independent_return_advantages(returns, dim=1) if self.config.baseline else returns
         advantages = advantages.detach()
 
         gradient = self.flat_grad((torch.stack(action_log_probs) * advantages[:-1]).sum()) / n
@@ -454,7 +471,7 @@ class GaussianTransport:
                 + (advantages[t] * c_mean).sum() * mean_gradients[t]
             ) / n
 
-        return gradient, base_return.mean()
+        return gradient, returns[0].detach().mean()
 
     def evaluate(self, n_particles=None, horizon=None, seed=None):
         """Monte Carlo objective of the frozen policy with M_val interacting particles."""

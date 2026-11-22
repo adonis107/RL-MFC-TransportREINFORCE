@@ -57,14 +57,18 @@ def score_identity_error(env, algorithm, policy, lambda_, horizon, seed=3):
             # The inverse maps of the density lemma, as functions of theta.
             target_mean = (randomized_mean - (1.0 - lambda_) * mean) / lambda_
             target_scale = (randomized_variance.sqrt() / deviation - (1.0 - lambda_)) / lambda_
-            log_density = (
-                -0.5 * ((target_mean - config.mean_randomizer_mean) / config.mean_randomizer_sigma) ** 2
-                - 0.5 * ((target_scale - config.scale_randomizer_mean) / config.scale_randomizer_sigma) ** 2
-                - math.log(config.mean_randomizer_sigma * config.scale_randomizer_sigma)
-                - math.log(2.0 * lambda_**2)
-                - torch.log(deviation)
-                - 0.5 * torch.log(randomized_variance)
-            )
+            log_a = torch.distributions.Normal(
+                config.mean_randomizer_mean, config.mean_randomizer_sigma
+            ).log_prob(target_mean)
+            if config.scale_randomizer == "lognormal":
+                log_b = torch.distributions.LogNormal(0.0, config.log_scale_randomizer_sigma).log_prob(target_scale)
+            else:
+                # Truncation normalization depends on lambda, not theta.
+                log_b = torch.distributions.Normal(
+                    config.scale_randomizer_mean, config.scale_randomizer_sigma
+                ).log_prob(target_scale)
+            log_density = (log_a + log_b - math.log(2.0 * lambda_**2)
+                           - torch.log(deviation) - 0.5 * torch.log(randomized_variance))
             reference = torch.autograd.grad(log_density, policy, retain_graph=True)[0].reshape(-1)
             mean_gradient = torch.autograd.grad(means[t], policy, retain_graph=True)[0].reshape(-1)
             log_deviation_gradient = (

@@ -16,6 +16,9 @@ from mfc.environments import (
     PortfolioConfig,
     TwoState,
     TwoStateConfig,
+    Traffic,
+    TrafficConfig,
+    TrafficPolicy,
 )
 
 
@@ -27,9 +30,11 @@ ENVIRONMENTS = {
     "lq": (LQ, LQConfig),
     "portfolio": (Portfolio, PortfolioConfig),
     "twostate": (TwoState, TwoStateConfig),
+    "traffic": (Traffic, TrafficConfig),
 }
 
 POLICIES = {
+    "traffic": TrafficPolicy,
     "advertising": AdvertisingPolicy,
     "cybersecurity": CybersecurityPolicy,
     "distribution": DistributionPolicy,
