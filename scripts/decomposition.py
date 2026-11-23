@@ -43,6 +43,8 @@ from mfc.environments.distribution import Distribution, DistributionConfig, Dist
 from mfc.environments.twostate import TwoState, TwoStateConfig
 from mfc.environments.lq import LQ, LQConfig
 from mfc.environments.portfolio import Portfolio, PortfolioConfig
+from mfc.environments.traffic import Traffic, TrafficConfig, TrafficPolicy
+from mfc.visualization.io import dataclass_from_dict
 from mfc.environments.randomizers import randomizer_for_run
 
 N_DRAWS = 4096
@@ -109,6 +111,8 @@ def kernel_matrix(env, laws):
 def action_probabilities(env, policy, t, laws):
     """(Q, S, A) action law of every state under each perturbed law."""
     n = laws.shape[0]
+    if callable(policy):
+        return policy(t, laws).expand(n, env.n_states, env.n_actions)
     rows = []
     for s in range(env.n_states):
         row = env.policy(policy, t, torch.tensor(s, device=env.device), laws)
@@ -124,13 +128,28 @@ def discrete_value(env, policy, horizon, discount, initial_law, scale, randomize
     independent draw per step, and its own marginal is propagated exactly.
     scale = 0 recovers the usual validation objective for either randomizer.
     """
-    n_draws = randomizer.n_draws
+    # With a shared traffic reward and an open-loop policy, the marginal and
+    # population coincide. Integrate the quadratic reward using the same fixed
+    # simplex bank, without replicating the entire flow across its draws.
+    if isinstance(env, Traffic) and hasattr(policy, "open_loop_probabilities"):
+        mu, value, factor = initial_law, 0.0, 1.0
+        probabilities = policy.open_loop_probabilities
+        linear = env.speed - env.config.comfort_cost * env.effort
+        for t in range(horizon):
+            nu = mu.unsqueeze(0) if t == 0 or scale == 0 else randomizer(mu, t, scale)
+            risk = (nu * (nu @ env.risk_matrix.T)).sum(-1).mean()
+            occupancy = mu.unsqueeze(-1) * probabilities[t]
+            value = value + factor * ((occupancy * linear).sum() - env.config.safety_cost * risk)
+            mu = torch.einsum("sa,sax->x", occupancy, env.transitions)
+            factor *= discount
+        return value
+    n_draws = randomizer.n_draws if scale else 1
     mu = initial_law
     marginal = initial_law.expand(n_draws, env.n_states)
     value = torch.zeros((), dtype=env.dtype, device=env.device)
     factor = 1.0
     for t in range(horizon):
-        nu = mu.expand(n_draws, -1) if t == 0 else randomizer(mu, t, scale)
+        nu = mu.expand(n_draws, -1) if t == 0 or scale == 0 else randomizer(mu, t, scale)
         probabilities = action_probabilities(env, policy, t, nu)
         rewards = reward_matrix(env, nu)
         kernels = kernel_matrix(env, nu)
@@ -141,7 +160,7 @@ def discrete_value(env, policy, horizon, discount, initial_law, scale, randomize
         base_kernel = kernel_matrix(env, mu.unsqueeze(0))
         mu = torch.einsum("s,qsa,qsax->x", mu, base, base_kernel)
         factor = factor * discount
-    nu = randomizer(mu, horizon, scale)
+    nu = mu.expand(n_draws, -1) if scale == 0 else randomizer(mu, horizon, scale)
     value = value + factor * (marginal * terminal_matrix(env, nu)).sum(dim=-1).mean()
     return value
 
@@ -223,7 +242,33 @@ def load_mlp(module, folder):
     return lambda t, mu: module(torch.tensor(float(t)), mu)
 
 
+def traffic_setup(metadata):
+    from traffic_optimality_gap import optimal_reference
+
+    config = dataclass_from_dict(TrafficConfig, metadata["env_config"], device="cpu")
+    if config.congestion_reward != "shared":
+        raise ValueError("The traffic decomposition requires the shared quadratic reward.")
+    env = Traffic(config)
+    reference, certificate = optimal_reference(env)
+    def open_loop(logits):
+        probabilities = logits.softmax(-1)
+        def policy(t, law):
+            return probabilities[min(int(t), config.T - 1)]
+        policy.open_loop_probabilities = probabilities
+        return policy
+    return {
+        "env": env, "horizon": config.T, "discount": config.gamma,
+        "initial_law": env.initial_distribution, "n_states": env.n_states,
+        "class_shape": (config.T, env.n_states, env.n_actions),
+        "parameterize": open_loop,
+        "reference": torch.as_tensor(reference, dtype=env.dtype).clamp_min(1e-12).log(),
+        "reference_certificate": certificate,
+        "load": lambda folder: load_mlp(TrafficPolicy(config), folder),
+    }
+
+
 DISCRETE_SETUP = {
+    "traffic": traffic_setup,
     "distribution": distribution_setup,
     "twostate": twostate_setup,
     "advertising": advertising_setup,
@@ -239,7 +284,7 @@ def discrete_evaluate(setup, raw, scale, randomizer):
 
 
 def discrete_optimum(setup, scale, randomizer, steps=3000, lr=0.05):
-    """theta*_lambda by gradient ascent inside the control class of theta*.
+    """Numerical perturbed reference inside the control class of theta*.
 
     The class is small but the objective is not concave in it, so the ascent is
     run from the unperturbed reference control as well as from the uninformative
@@ -250,16 +295,20 @@ def discrete_optimum(setup, scale, randomizer, steps=3000, lr=0.05):
     best = max(discrete_evaluate(setup, start, scale, randomizer) for start in starts)
     for start in starts:
         raw = start.clone().requires_grad_(True)
-        optimizer = torch.optim.Adam([raw], lr=lr)
-        for _ in range(steps):
+        optimizer = torch.optim.LBFGS([raw], lr=1.0, max_iter=steps, history_size=30,
+                                      tolerance_grad=1e-7, tolerance_change=1e-10,
+                                      line_search_fn="strong_wolfe")
+        def closure():
             optimizer.zero_grad()
             value = discrete_value(
                 setup["env"], setup["parameterize"](raw), setup["horizon"],
                 setup["discount"], setup["initial_law"], scale, randomizer,
             )
             (-value).backward()
-            optimizer.step()
+            return -value
+        optimizer.step(closure)
         best = max(best, discrete_evaluate(setup, raw.detach(), scale, randomizer))
+    print(f"{type(setup['env']).__name__} scale={scale:g} reference={best:.9g}", flush=True)
     return best
 
 
@@ -287,14 +336,19 @@ def continuous_optimum(env, lambda_, sign, randomizer=None, steps=20000, lr=0.01
     if key in _CONTINUOUS_OPTIMUM_CACHE:
         return _CONTINUOUS_OPTIMUM_CACHE[key]
     theta = env.optimal_theta().clone().detach().requires_grad_(True)
-    optimizer = torch.optim.Adam([theta], lr=lr)
-    for _ in range(steps):
+    optimizer = torch.optim.LBFGS([theta], lr=1.0, max_iter=steps, history_size=30,
+                                  tolerance_grad=1e-9, tolerance_change=1e-12,
+                                  line_search_fn="strong_wolfe")
+    def closure():
         optimizer.zero_grad()
-        (-continuous_value(env, theta, lambda_, sign, randomizer)).backward()
-        optimizer.step()
+        loss = -continuous_value(env, theta, lambda_, sign, randomizer)
+        loss.backward()
+        return loss
+    optimizer.step(closure)
     with torch.no_grad():
         value = float(continuous_value(env, theta.detach(), lambda_, sign, randomizer))
     _CONTINUOUS_OPTIMUM_CACHE[key] = value
+    print(f"{type(env).__name__} scale={lambda_:g} reference={value:.9g}", flush=True)
     return value
 
 
@@ -532,6 +586,7 @@ def report(env, root, filter_text=None):
 
 
 DISPLAY = {
+    "traffic": "Traffic",
     "lq": "Linear--quadratic",
     "portfolio": "Portfolio",
     "distribution": "Distribution",
@@ -539,20 +594,17 @@ DISPLAY = {
     "advertising": "Advertising",
     "bimodal": "Bimodal allocation",
 }
-BENCHMARKS = ["twostate", "distribution", "advertising", "lq", "portfolio", "bimodal"]
+BENCHMARKS = ["twostate", "distribution", "advertising", "traffic", "lq", "portfolio", "bimodal"]
 
 
 # AISTATS sets table captions above the table.
 CAPTION = (
-        "\\caption{Two sources of the residual error of each run: the displacement of the value of "
-        "the perturbed problem, $|J^\\lambda(\\theta_\\lambda^\\star)-J(\\theta^\\star)|$, and the error left in "
-        "optimizing it, $|J^\\lambda(\\widehat\\theta_\\lambda)-J^\\lambda(\\theta_\\lambda^\\star)|$. Here "
-        "$\\theta_\\lambda^\\star$ maximizes $J^\\lambda$ in the control class that realizes $\\theta^\\star$, and "
-        "$\\widehat\\theta_\\lambda$ is the parameter the run returns; MF-REINFORCE is taken against its "
-        "own perturbed objective, at scale $\\varepsilon$, and REINFORCE optimizes $J$ itself. The final gap "
-        "is bounded by the sum of both and of $|J(\\widehat\\theta_\\lambda)-J^\\lambda(\\widehat\\theta_\\lambda)|$, "
-        "so the displacement can exceed it. Every quantity is exact given the run; dispersion is over five "
-        "seeds. Cybersecurity has no known optimum.}"
+        "\\caption{Effect of perturbation on objective values and optimization. "
+        "\\emph{Value change}: $|J^\\lambda(\\theta_\\lambda^\\star)-J(\\theta^\\star)|$; "
+        "\\emph{Opt.\\ error}: $|J^\\lambda(\\widehat\\theta_\\lambda)-J^\\lambda(\\theta_\\lambda^\\star)|$; "
+        "\\emph{Final gap}: $|J(\\widehat\\theta_\\lambda)-J(\\theta^\\star)|$. "
+        "Objectives are evaluated from the population equations; dispersion is over five seeds. "
+        "MF-REINFORCE uses its own perturbed objective and scale $\\varepsilon$.}"
 )
 
 
@@ -573,20 +625,28 @@ def tex_spread(mean, deviation, digits):
 def tex_table(collected, path):
     """LaTeX form of the decomposition, every arm of every benchmark."""
     digits = 4
+    header = "Benchmark & Estimator & Scale & Value change & Opt.\\ error & Final gap \\\\"
     lines = [
-        "\\begin{table}[H]",
-        "\\centering",
-        "\\small",
+        "{\\small",
         "\\setlength{\\tabcolsep}{3.5pt}",
+        "\\setlength{\\LTcapwidth}{\\textwidth}",
+        "\\begin{longtable}{llrrrr}",
         CAPTION,
-        "\\label{tab:decomposition}",
-        "\\begin{tabular}{llrrrr}",
+        "\\label{tab:decomposition}\\\\",
         "\\toprule",
-        "Benchmark & Estimator & Scale & "
-        "$|J^\\lambda(\\theta_\\lambda^\\star)-J(\\theta^\\star)|$ & "
-        "$|J^\\lambda(\\widehat\\theta_\\lambda)-J^\\lambda(\\theta_\\lambda^\\star)|$ & "
-        "$|J(\\widehat\\theta_\\lambda)-J(\\theta^\\star)|$ \\\\",
+        header,
         "\\midrule",
+        "\\endfirsthead",
+        "\\multicolumn{6}{l}{\\tablename~\\thetable\\ (continued)}\\\\",
+        "\\toprule",
+        header,
+        "\\midrule",
+        "\\endhead",
+        "\\midrule",
+        "\\multicolumn{6}{r}{Continued on the next page}\\\\",
+        "\\endfoot",
+        "\\bottomrule",
+        "\\endlastfoot",
     ]
     for index, result in enumerate(collected):
         first = True
@@ -616,9 +676,8 @@ def tex_table(collected, path):
         if index != len(collected) - 1:
             lines.append("\\midrule")
     lines += [
-        "\\bottomrule",
-        "\\end{tabular}",
-        "\\end{table}",
+        "\\end{longtable}",
+        "}",
         "",
     ]
     path = Path(path)

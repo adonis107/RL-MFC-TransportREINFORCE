@@ -38,7 +38,7 @@ from correction_alignment import build_env, reference_policy
 from mfc.algorithms.transport import DiscreteTransport, DiscreteTransportConfig
 from mfc.visualization.tables import save_table
 
-DISCRETE = {"twostate": 5, "cybersecurity": 3, "distribution": 5, "advertising": 5}
+DISCRETE = {"twostate": 5, "cybersecurity": 3, "distribution": 5, "advertising": 5, "traffic": 5}
 CONTINUOUS = {"lq": 20, "portfolio": 10, "bimodal": 1}
 # Continuous benchmarks with a closed-form perturbed objective, for V2.
 CONTINUOUS_EXACT = {"lq": -1.0, "portfolio": 1.0}
@@ -170,7 +170,18 @@ def v2_discrete(name, horizon, device, seed, paths):
     generator = torch.Generator(device=env.device)
     generator.manual_seed(seed + 5000)
     # Common random numbers: one bank of perturbation paths reused at every lambda.
-    bank = [[estimator.sample_simplex(generator) for _ in range(horizon + 1)] for _ in range(paths)]
+    bank = torch.stack([torch.stack([estimator.sample_simplex(generator) for _ in range(horizon + 1)])
+                        for _ in range(paths)])
+    from decomposition import discrete_value
+    class PathRandomizer:
+        n_draws = paths
+        def __call__(self, mu, t, scale):
+            return (1.0 - scale) * mu + scale * bank[:, t]
+    randomizer = PathRandomizer()
+    policy = algorithm.policy
+    if isinstance(policy, torch.nn.Module):
+        module = policy
+        policy = lambda t, law: module(algorithm.policy_time(t), law)
 
     base_value = discrete_flow(env, algorithm, horizon)
     base_grad = flat_grad(base_value, algorithm)
@@ -178,10 +189,8 @@ def v2_discrete(name, horizon, device, seed, paths):
 
     rows = []
     for lambda_ in LAMBDAS:
-        total = torch.zeros((), dtype=env.dtype, device=env.device)
-        for psi in bank:
-            total = total + discrete_flow(env, algorithm, horizon, laws=(psi, lambda_))
-        total = total / paths
+        total = discrete_value(env, policy, horizon, algorithm.discount,
+                               env.initial_distribution, lambda_, randomizer)
         gradient = flat_grad(total, algorithm)
         objective_gap = abs(float(total) - base_value)
         gradient_gap = float((gradient - base_grad).norm())

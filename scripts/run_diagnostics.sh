@@ -21,7 +21,7 @@ run theory_estimate     scripts/verify_theory.py --part v1 --output-root results
 run theory_consistency  scripts/verify_theory.py --part v2 --paths 400 --output-root results/figures/theory_400 &
 run bounds_continuous   scripts/verify_bounds.py --env all --sweep all --replications-lambda 1024 &
 run perturbation_scales scripts/tune_perturbation.py --env all --force &
-for env in twostate cybersecurity distribution advertising; do
+for env in twostate cybersecurity distribution advertising traffic; do
     run "discrete_eta_$env" scripts/verify_discrete_eta.py --env "$env" --compare-batches \
         --output "results/figures/discrete_eta/discrete_eta_$env.csv" &
     run "bounds_$env" scripts/verify_discrete_bounds.py --env "$env" \

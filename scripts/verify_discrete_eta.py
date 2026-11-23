@@ -48,9 +48,12 @@ from mfc.environments import (
     DistributionConfig,
     TwoState,
     TwoStateConfig,
+    Traffic,
+    TrafficConfig,
 )
 
 ENVIRONMENTS = {
+    "traffic": (Traffic, TrafficConfig),
     "twostate": (TwoState, TwoStateConfig),
     "cybersecurity": (Cybersecurity, CybersecurityConfig),
     "distribution": (Distribution, DistributionConfig),
@@ -134,6 +137,7 @@ def measure(name, replications, gradient_replications, compare_batches):
         for variant, estimator in variants.items():
             d_errors = [relative_error(estimator(10_000 + r), sensitivity_oracle) for r in range(replications)]
             row = {"env": name, "grid": kind, "eta": eta, "batches": variant, "n": allocation["n"],
+                   "replications": replications, "gradient_replications": gradient_replications,
                    "d_mse": sum(d_errors) / len(d_errors)}
             if variant == "reused":
                 g_errors = []

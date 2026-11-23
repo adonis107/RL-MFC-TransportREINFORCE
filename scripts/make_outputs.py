@@ -12,6 +12,7 @@ Outputs are written under ``outputs/`` by default:
 """
 
 import argparse
+from functools import lru_cache
 import json
 import re
 import sys
@@ -744,6 +745,8 @@ def appendix_benchmarks(results_root, output):
             ax.fill_between(steps, mean - deviation, mean + deviation,
                             color=METHOD_COLOR[method], alpha=0.20, linewidth=0)
         optimum = REFERENCE_OPTIMUM.get((env, run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]))
+        if env == "traffic":
+            optimum = reference_optimum(results_root, env)
         if optimum is not None:
             ax.axhline(optimum, color=OPTIMAL, linewidth=1.0, dashes=(3, 2), label=r"$\theta^\star$")
         draw_ihmfc_learning(ax, results_root, env, gap=False)
@@ -763,6 +766,9 @@ def appendix_benchmarks(results_root, output):
             readout = lambda law: float(law @ simulator.risk_matrix @ law)
             title, ylabel = "Traffic: proximity risk", r"$\mu_t^\top R\mu_t$"
             optimal_theta = None
+            if config.congestion_reward == "shared":
+                probabilities, _ = traffic_reference_solution(config)
+                optimal_theta = lambda t, law: probabilities[min(int(t), config.T - 1)]
         elif env == "cybersecurity":
             simulator = Cybersecurity(CybersecurityConfig(T=3, device="cpu"))
             module_class, config = CybersecurityPolicy, simulator.config
@@ -998,9 +1004,9 @@ def theory_verification(estimate_csv, consistency_csv, output):
     save_figure(figure, output)
 
 
-ETA_ENVS = ("twostate", "cybersecurity", "distribution", "advertising")
-ETA_COLOR = dict(zip(ETA_ENVS, ["#1baf7a", "#e87ba4", "#eda100", "#008300"]))
-ETA_MARKER = dict(zip(ETA_ENVS, ["^", "v", "D", "s"]))
+ETA_ENVS = ("twostate", "cybersecurity", "distribution", "advertising", "traffic")
+ETA_COLOR = {env: ENV_COLOR[env] for env in ETA_ENVS}
+ETA_MARKER = {env: ENV_MARKER[env] for env in ETA_ENVS}
 
 
 def discrete_eta(eta_csv, output):
@@ -1074,7 +1080,7 @@ def discrete_eta_table(eta_csv):
         "Auxiliary radius on the finite benchmarks, at the initial policy and $\\lambda=B^{-1/4}$: relative "
         "mean-square errors $\\sum_t\\E\\|\\widehat D_t-D_t\\|_F^2/\\sum_t\\|D_t\\|_F^2$ and "
         "$\\E\\|\\widehat G-\\nabla_\\theta J\\|^2/\\|\\nabla_\\theta J\\|^2$ against the exact sensitivities "
-        "and gradient, over 100 and 50 replications. The first rows of each benchmark are "
+        "and gradient. Replication counts are recorded in the diagnostic CSV. The first rows of each benchmark are "
         "$\\eta_\\star/2$, $\\eta_\\star$ and $2\\eta_\\star$ when below one, with $\\eta_\\star=n^{-1/4}$."
     )
     return table_environment("\n".join(lines), caption, "tab:discrete-eta", "lrrrrr", size="\\small")
@@ -1123,9 +1129,8 @@ def twostate_eta_sweep(results_root, output):
 
 
 BOUND_COLOR, BOUND_MARKER = ENV_COLOR, ENV_MARKER
-BOUND_ENVS = ("lq", "portfolio", "twostate", "cybersecurity", "distribution", "advertising")
+BOUND_ENVS = ("lq", "portfolio", "twostate", "cybersecurity", "distribution", "advertising", "traffic")
 # The bimodal benchmark has a scalar parameter and T=1, and is not swept.
-MAIN_BOUND_ENVS = ("twostate", "distribution", "lq", "portfolio")
 
 
 def lambda_fit_mask(block):
@@ -1158,6 +1163,16 @@ def bound_slope(x, y):
     if keep.sum() < 2:
         return float("nan")
     return float(np.polyfit(np.log(x[keep]), np.log(y[keep]), 1)[0])
+
+
+def bound_fit_rows(rows, sweep):
+    if sweep == "B" and not rows.empty:
+        rows = rows[rows["lambda_"] == rows["lambda_"].min()]
+    if sweep == "lambda" and not rows.empty:
+        rows = rows[lambda_fit_mask(rows)]
+    if sweep == "eta-exact" and "numerical_floor" in rows:
+        rows = rows[rows["error"] > rows["numerical_floor"].fillna(0.0)]
+    return rows
 
 
 def guide(ax, x, y, exponent, anchor=0):
@@ -1213,6 +1228,10 @@ def bounds_radius(bounds_csv, output):
                 markersize=3.0, linewidth=1.1, label=r"$\mathbb{E}\|\widehat D-D\|^2$")
         ax.plot(taylor["value"], taylor["error"], color=OPTIMAL, marker="^", markersize=3.0,
                 linewidth=1.1, dashes=(3, 2), label=r"$\|D_\eta-D\|^2$")
+        if ("numerical_floor" in taylor and not taylor.empty
+                and (taylor["error"] <= taylor["numerical_floor"]).all()):
+            ax.text(0.03, 0.14, "exact-flow error at roundoff", transform=ax.transAxes,
+                    fontsize=6.0, color=MUTED)
         # The bound balances at eta ~ n_0^(-1/6), with n_0 = n / (2 d_theta) particles per shifted system.
         per_system = verify_bounds.BENCHMARKS[env][5] / (2 * run_plan.TRANSPORT_ALLOCATIONS[env]["d_theta"])
         ax.axvline(per_system ** (-1 / 6), color=MUTED, linewidth=0.8, dashes=(1.2, 1.6), zorder=1)
@@ -1286,20 +1305,46 @@ def bounds_exponents(bounds_csv, envs=BOUND_ENVS, label="tab:bounds-exponents", 
         cells = []
         for env in envs:
             rows = table[(table["env"] == env) & (table["sweep"] == sweep)]
-            if sweep == "B" and not rows.empty:
-                rows = rows[rows["lambda_"] == rows["lambda_"].min()]
-            if sweep == "lambda" and not rows.empty:
-                rows = rows[lambda_fit_mask(rows)]
-            cells.append("---" if rows.empty else f"${bound_slope(rows['value'], rows[column]):+.2f}$")
+            rows = bound_fit_rows(rows, sweep)
+            slope = bound_slope(rows["value"], rows[column]) if not rows.empty else float("nan")
+            cells.append("---" if not np.isfinite(slope) else f"${slope:+.2f}$")
         lines.append(" & ".join([quantity, knob] + cells + [f"${exponent:+.0f}$"]) + " \\\\")
     caption = (
         "Slope $p$ of each error against the quantity swept, fitted by least squares on a log-log "
         "scale, at $\\theta=\\tfrac12\\theta^\\star$ on the continuous benchmarks and at the initial "
         "policy on the finite ones, with $p_0$ the slope of the mechanism producing it. The $\\lambda$ "
-        "row is fitted on the lower half of the scales whose bias exceeds twice its Monte Carlo resolution."
+        "row is fitted on the lower half of the scales whose bias exceeds twice its Monte Carlo resolution. "
+        "No slope is reported for errors below floating-point resolution."
     )
     return table_environment("\n".join(lines), caption, label,
                              "ll" + "r" * len(envs) + "r", size="\\footnotesize", wide=wide, tabcolsep="4pt")
+
+
+def main_bounds_exponents(bounds_csv):
+    """Compact main-text ranges, using the same fits as the appendix table."""
+    table, envs = _bounds_table(bounds_csv)
+    if table is None:
+        return None
+    names = ("Sensitivity MSE", "Sensitivity MSE", "Gradient bias", "Gradient variance", "Population MSE")
+    lines = ["Error & Swept & $p_0$ & Measured $p$ \\\\", "\\midrule"]
+    for name, (sweep, knob, _, column, exponent) in zip(names, BOUND_SWEEPS):
+        slopes = []
+        for env in envs:
+            rows = table[(table["env"] == env) & (table["sweep"] == sweep)]
+            if rows.empty:
+                continue
+            rows = bound_fit_rows(rows, sweep)
+            slope = bound_slope(rows["value"], rows[column])
+            if np.isfinite(slope):
+                slopes.append(slope)
+        interval = f"$[{min(slopes):.2f},{max(slopes):.2f}]$" if slopes else "---"
+        lines.append(f"{name} & {knob} & ${exponent:.0f}$ & {interval} \\\\")
+    caption = (f"Predicted powers $p_0$ and ranges of fitted log-log slopes $p$ across the {len(envs)} "
+               "benchmarks in Table~\\ref{tab:bounds-exponents}. The exact-flow auxiliary-radius sweep "
+               "uses the two continuous benchmarks. No slope is fitted below floating-point resolution. "
+               "The same fitting rules are used in both tables.")
+    return table_environment("\n".join(lines), caption, "tab:bounds-exponents-main", "llrr",
+                             size="\\footnotesize", tabcolsep="3pt")
 
 
 def method_of(label):
@@ -1374,6 +1419,12 @@ def select_headline(grouped, env):
 
 
 def reference_optimum(results_root, env):
+    if env == "traffic":
+        runs = load_env_runs(results_root, env)
+        if not runs:
+            return None
+        config = dataclass_from_dict(TrafficConfig, runs[0]["metadata"]["env_config"], device="cpu")
+        return traffic_reference_value(config)
     horizon = run_plan.TRANSPORT_ALLOCATIONS[env]["horizon"]
     if (env, horizon) in REFERENCE_OPTIMUM:
         return REFERENCE_OPTIMUM[(env, horizon)]
@@ -1387,12 +1438,25 @@ def reference_optimum(results_root, env):
     return -float(values.iloc[0]) if convention == "cost" else float(values.iloc[0])
 
 
+def traffic_reference_value(config):
+    if config.congestion_reward != "shared":
+        return None
+    _, certificate = traffic_reference_solution(config)
+    return certificate["exact_value_lower_bound"]
+
+
+@lru_cache(maxsize=None)
+def traffic_reference_solution(config):
+    from traffic_optimality_gap import optimal_reference
+    env = Traffic(config)
+    probabilities, certificate = optimal_reference(env)
+    return torch.as_tensor(probabilities, dtype=env.dtype), certificate
+
+
 def objective_summary(results_root):
-    envs = [name for name in BENCHMARKS if has_run(results_root, name)]
-    finite_differences = any(finite_difference_stem(results_root, env) for env in envs)
+    envs = [name for name in APPENDIX_ENVS if has_run(results_root, name)]
     lines = [
-        "Benchmark & $T$ & Optimum & REINFORCE & MF-REINFORCE & Transport & $(\\lambda,\\eta)$"
-        + (" & Finite diff." if finite_differences else "") + " \\\\",
+        "Benchmark & $T$ & Reference & REINFORCE & MF-REINFORCE & Transport & $(\\lambda,\\eta)$ \\\\",
         "\\midrule",
     ]
     for env in envs:
@@ -1420,18 +1484,18 @@ def objective_summary(results_root):
                     with_error(best.get("mfreinforce"), digits),
                     with_error(transport, digits),
                     scales,
-                ] + ([with_error(best.get("finitediff"), digits)] if finite_differences else [])
+                ]
             )
             + " \\\\"
         )
     caption = (
-        "Final validation objective on every benchmark, as mean and standard deviation over seeds. "
-        "Higher is better. The transport column shows the best run of the scale grid; every scale of "
-        "Transport and Transport-Proba on the continuous benchmarks is in Table~\\ref{tab:continuous-comparison}."
+        "Final validation objective on the three benchmarks absent from Table~\\ref{tab:main-summary} "
+        "(mean $\\pm$ standard deviation over five seeds; larger is better). Transport uses the scale "
+        "with the highest mean final objective. Reference values are computed from the benchmark models; "
+        "gap evaluation is described in Appendix~\\ref{app:evaluation}."
     )
-    alignment = "lrrrrrl" + ("r" if finite_differences else "")
-    return table_environment("\n".join(lines), caption, "tab:objective-summary", alignment, size="\\footnotesize",
-                             tabcolsep="4pt")
+    return table_environment("\n".join(lines), caption, "tab:objective-summary", "lrrrrrl", size="\\footnotesize",
+                             tabcolsep="4pt").replace("\\begin{table}[H]", "\\begin{table}[h]", 1)
 
 
 ESTIMATORS = [
@@ -1840,11 +1904,11 @@ def main():
     bounds_radius(ROOT / args.bounds, figures / "bounds_radius.pdf")
     bounds_rates(ROOT / args.bounds, figures / "bounds_rates.pdf")
     bounds_rates(ROOT / args.bounds, figures / "bounds_rates_finite.pdf",
-                 ("twostate", "cybersecurity", "distribution", "advertising"))
+                 ("twostate", "cybersecurity", "distribution", "advertising", "traffic"))
     exponents = bounds_exponents(ROOT / args.bounds)
     if exponents is not None:
         write_table(exponents, tables / "bounds_exponents.tex")
-    exponents = bounds_exponents(ROOT / args.bounds, MAIN_BOUND_ENVS, "tab:bounds-exponents-main", wide=True)
+    exponents = main_bounds_exponents(ROOT / args.bounds)
     if exponents is not None:
         write_table(exponents, tables / "bounds_exponents_main.tex")
     write_table(continuous_comparison(results_root), tables / "continuous_comparison.tex")

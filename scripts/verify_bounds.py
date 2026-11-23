@@ -16,8 +16,10 @@ what makes the exponents readable rather than a sum of confounded effects:
 
   eta         (P), both terms.  flow='particle'.  A U-curve whose minimum the
               bound places at eta ~ n^(-1/6).
-  eta-exact   (P), Taylor term alone.  flow='exact' makes the shifted flows
-              analytic, so 1/(n eta^2) vanishes and the error is pure eta^4.
+  eta-exact   (P), Taylor term alone. flow='exact' makes the shifted flows
+              analytic. The physical moment secants on these quadratic
+              benchmarks are exact up to roundoff, in which case no eta
+              exponent is resolved; eta^4 remains an upper-bound rate.
   n           (P), sampling term alone.  eta held fixed, so the eta^4 floor is
               a constant and the excess above it should fall as 1/n.
   lambda      (T), perturbation term alone.  flow='exact' and the oracle
@@ -198,6 +200,9 @@ def run_sweeps(name, args):
     policy = reference_policy(env, args.policy_fraction)
     reference = oracle_gradient(env, policy, sign)
     oracle_z, oracle_D = oracle_coordinates(env, policy, horizon)
+    # A conservative squared roundoff scale, relative to the oracle tangent.
+    numerical_floor = 1e6 * torch.finfo(env.dtype).eps**2 * max(
+        1.0, sum(float(d.square().sum()) for d in oracle_D))
     eta_default = 0.95
     d_theta = policy.numel()
     n_grid = auxiliary_grid(n, d_theta)
@@ -224,10 +229,16 @@ def run_sweeps(name, args):
             algorithm = build(env, policy, lambda_default, eta, flow, B, n, M, horizon)
             error, deviation = sensitivity_error(algorithm, oracle_D, args.replications_d)
             errors.append(error)
-            record(sweep, label, eta, error=error, error_se=deviation)
+            record(sweep, label, eta, error=error, error_se=deviation,
+                   numerical_floor=numerical_floor)
             print(f"   eta={eta:<6} E||D_hat-D||^2 = {error:12.5e} +- {deviation:.1e}")
         if sweep == "eta-exact":
-            print(f"   fitted exponent in eta: {log_slope(grid, errors):+.2f}   (bound: +4)")
+            resolved = [(eta, error) for eta, error in zip(grid, errors) if error > numerical_floor]
+            if len(resolved) >= 2:
+                x, y = zip(*resolved)
+                print(f"   fitted exponent in eta: {log_slope(x, y):+.2f}   (bound: +4)")
+            else:
+                print("   no resolved truncation rate: exact-flow error is at floating-point roundoff")
         else:
             best = grid[int(np.argmin(errors))]
             print(f"   minimiser eta = {best}   (bound's rule n^(-1/6) = {n ** (-1 / 6):.3f})")
